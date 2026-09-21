@@ -83,3 +83,6 @@ kiro_error.*
 
 # 本地数据文件
 account_manager.db
+account_manager.db*
+account_manager.db-shm
+account_manager.db-wal

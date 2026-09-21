@@ -9,10 +9,19 @@ from api.tasks import (
     _run_register,
     _task_store,
     normalize_register_retry_times,
+    uses_sms_register_flow,
 )
 from core.base_mailbox import BaseMailbox, MailboxAccount
 from core.base_platform import Account, BasePlatform
 from core.task_runtime import NonRetryableRegisterError
+
+
+class SmsRegisterFlowDetectionTests(unittest.TestCase):
+    def test_phone_with_email_uses_sms_budget(self):
+        self.assertTrue(uses_sms_register_flow({"chatgpt_register_flow": "phone_with_email"}))
+        self.assertTrue(uses_sms_register_flow({"chatgpt_register_flow": "phone"}))
+        self.assertTrue(uses_sms_register_flow({"register_method": "sms"}))
+        self.assertFalse(uses_sms_register_flow({"chatgpt_register_flow": "email"}))
 
 
 class _FakeMailbox(BaseMailbox):

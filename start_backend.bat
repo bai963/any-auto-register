@@ -16,11 +16,43 @@ if errorlevel 1 (
   exit /b 1
 )
 
+where npm >nul 2>nul
+if errorlevel 1 (
+  echo [ERROR] 未找到 npm 命令。请先安装 Node.js 18+，并确保 npm 可在终端中使用。
+  exit /b 1
+)
+
 cd /d "%~dp0"
 echo [INFO] 项目目录: %CD%
 echo [INFO] 使用 conda 环境: %ENV_NAME%
 echo [INFO] 启动后端: http://localhost:%PORT%
 echo [INFO] 按 Ctrl+C 可停止服务
+
+if not exist "frontend\node_modules" (
+  echo [INFO] 前端依赖未安装，正在安装
+  pushd "frontend"
+  if exist "package-lock.json" (
+    call npm ci
+  ) else (
+    call npm install
+  )
+  if errorlevel 1 (
+    popd
+    echo [ERROR] 前端依赖安装失败。
+    exit /b 1
+  )
+  popd
+)
+
+echo [INFO] 正在构建前端
+pushd "frontend"
+call npm run build
+if errorlevel 1 (
+  popd
+  echo [ERROR] 前端构建失败。
+  exit /b 1
+)
+popd
 
 if "%RESTART_EXISTING%"=="1" (
   echo [INFO] 启动前先清理旧的后端 / Solver 进程

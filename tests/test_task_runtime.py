@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from core.task_runtime import (
     RegisterTaskControl,
@@ -18,6 +19,19 @@ class RegisterTaskControlTests(unittest.TestCase):
             control.checkpoint()
 
         control.checkpoint()
+
+    def test_attempt_heartbeat_exposes_stage_and_staleness(self):
+        control = RegisterTaskControl()
+        with mock.patch("core.task_runtime.time.time", side_effect=[100.0, 105.0]):
+            attempt_id = control.start_attempt()
+            control.heartbeat(attempt_id, "sms_waiting")
+        with mock.patch("core.task_runtime.time.time", return_value=165.0):
+            snapshot = control.snapshot()
+
+        self.assertEqual(snapshot["active_attempts"], 1)
+        self.assertEqual(snapshot["attempt_stage_counts"], {"sms_waiting": 1})
+        self.assertEqual(snapshot["oldest_attempt_heartbeat_seconds"], 60)
+        control.finish_attempt(attempt_id)
 
     def test_stop_request_is_sticky(self):
         control = RegisterTaskControl()

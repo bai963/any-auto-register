@@ -40,7 +40,12 @@ interface TaskSnapshot {
   errors: string[]
   created_at: number | string | null
   updated_at: number | string | null
-  control: { stop_requested: boolean }
+  control: {
+    stop_requested: boolean
+    active_attempts?: number
+    oldest_attempt_heartbeat_seconds?: number
+    attempt_stage_counts?: Record<string, number>
+  }
 }
 
 const SOURCE_LABELS: Record<string, string> = {
@@ -169,6 +174,11 @@ export default function RunningTasks() {
     const duration = isActive(task)
       ? formatDuration(task.created_at, now)
       : formatDuration(task.created_at, task.updated_at)
+    const activeAttempts = Number(task.control?.active_attempts || 0)
+    const staleSeconds = Number(task.control?.oldest_attempt_heartbeat_seconds || 0)
+    const stages = task.control?.attempt_stage_counts || {}
+    const stageSummary = Object.entries(stages).map(([stage, count]) => `${stage}×${count}`).join('，')
+    const stalled = isActive(task) && activeAttempts > 0 && staleSeconds >= 60
 
     return (
       <Card
@@ -224,7 +234,22 @@ export default function RunningTasks() {
                 }
                 format={() => `${done}/${total}`}
               />
-              <Space size={8}>
+              <Space size={8} wrap>
+                {isActive(task) && activeAttempts > 0 && (
+                  <Text type={stalled ? 'danger' : 'secondary'} style={{ fontSize: 11 }}>
+                    活跃 {activeAttempts} · 最久心跳 {staleSeconds}s
+                  </Text>
+                )}
+                {isActive(task) && stageSummary && (
+                  <Text type="secondary" style={{ fontSize: 11 }} title={stageSummary}>
+                    阶段：{stageSummary}
+                  </Text>
+                )}
+                {stalled && (
+                  <Tag color={staleSeconds >= 120 ? 'error' : 'warning'} style={{ margin: 0 }}>
+                    {staleSeconds >= 120 ? '疑似卡死' : '心跳延迟'}
+                  </Tag>
+                )}
                 <Text style={{ fontSize: 11, color: 'var(--success)' }}>
                   ✓ 成功 {success}
                 </Text>

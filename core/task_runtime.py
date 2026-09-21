@@ -9,6 +9,8 @@ import threading
 import time
 from typing import Any
 
+from core.db import DATABASE_REGISTER_CONCURRENCY_CAP
+
 
 class TaskInterruption(RuntimeError):
     """任务执行过程中触发的协作式中断。"""
@@ -75,9 +77,10 @@ class AttemptResult:
 def _read_global_concurrency_limit() -> int:
     """读取全局高 I/O 任务预算，避免多个任务叠加压垮外部服务。"""
     try:
-        return max(1, min(int(os.getenv("TASK_GLOBAL_MAX_CONCURRENCY", "200")), 200))
+        configured = int(os.getenv("TASK_GLOBAL_MAX_CONCURRENCY", str(DATABASE_REGISTER_CONCURRENCY_CAP)))
+        return max(1, min(configured, DATABASE_REGISTER_CONCURRENCY_CAP))
     except ValueError:
-        return 200
+        return DATABASE_REGISTER_CONCURRENCY_CAP
 
 
 class TaskConcurrencyLimiter:
@@ -106,17 +109,19 @@ class ExternalServiceLimiter(TaskConcurrencyLimiter):
 
 def _read_external_limit(name: str, default: int) -> int:
     try:
-        # 外部服务配额可小于总任务并发，但不允许超过单进程的 200 worker 上限。
-        return max(1, min(int(os.getenv(name, str(default))), 200))
+        # 外部服务配额也不能超过当前数据库模式允许的注册 worker 上限。
+        return max(1, min(int(os.getenv(name, str(default))), DATABASE_REGISTER_CONCURRENCY_CAP))
     except ValueError:
         return default
 
 
 # 这些限制覆盖完整的外部链路，而不只是单个 HTTP 请求，防止轮询/重试时瞬间放大流量。
 global_task_concurrency_limiter = TaskConcurrencyLimiter()
-global_openai_limiter = ExternalServiceLimiter(_read_external_limit("OPENAI_MAX_CONCURRENCY", 200))
-global_mail_limiter = ExternalServiceLimiter(_read_external_limit("MAIL_API_MAX_CONCURRENCY", 100))
-global_sms_limiter = ExternalServiceLimiter(_read_external_limit("SMS_API_MAX_CONCURRENCY", 100))
+# 完整手机注册会持有邮箱、OpenAI、接码预算。默认必须与数据库的 worker
+# 硬上限对齐：否则 PostgreSQL 虽允许 200 worker，却会被邮箱/接码预算暗中截成 100。
+global_openai_limiter = ExternalServiceLimiter(_read_external_limit("OPENAI_MAX_CONCURRENCY", DATABASE_REGISTER_CONCURRENCY_CAP))
+global_mail_limiter = ExternalServiceLimiter(_read_external_limit("MAIL_API_MAX_CONCURRENCY", DATABASE_REGISTER_CONCURRENCY_CAP))
+global_sms_limiter = ExternalServiceLimiter(_read_external_limit("SMS_API_MAX_CONCURRENCY", DATABASE_REGISTER_CONCURRENCY_CAP))
 
 
 class RegisterTaskControl:
@@ -129,6 +134,8 @@ class RegisterTaskControl:
         self._next_attempt_id = 1
         self._active_attempt_ids: set[int] = set()
         self._skip_active_attempt_ids: set[int] = set()
+        # attempt 级心跳用于识别「线程还在但所有日志/进度都停了」的卡死。
+        self._attempts: dict[int, dict[str, Any]] = {}
 
     def request_stop(self) -> None:
         with self._lock:
@@ -145,8 +152,22 @@ class RegisterTaskControl:
         with self._lock:
             attempt_id = self._next_attempt_id
             self._next_attempt_id += 1
+            now = time.time()
             self._active_attempt_ids.add(attempt_id)
+            self._attempts[attempt_id] = {
+                "started_at": now, "last_heartbeat_at": now, "stage": "started",
+            }
             return attempt_id
+
+    def heartbeat(self, attempt_id: int | None, stage: str = "") -> None:
+        if attempt_id is None:
+            return
+        with self._lock:
+            item = self._attempts.get(attempt_id)
+            if item is not None:
+                item["last_heartbeat_at"] = time.time()
+                if stage:
+                    item["stage"] = str(stage)[:80]
 
     def finish_attempt(self, attempt_id: int | None) -> None:
         if attempt_id is None:
@@ -154,6 +175,7 @@ class RegisterTaskControl:
         with self._lock:
             self._active_attempt_ids.discard(attempt_id)
             self._skip_active_attempt_ids.discard(attempt_id)
+            self._attempts.pop(attempt_id, None)
 
     def checkpoint(
         self,
@@ -181,11 +203,21 @@ class RegisterTaskControl:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            now = time.time()
+            attempts = [dict(item, attempt_id=attempt_id) for attempt_id, item in self._attempts.items()]
+            stages: dict[str, int] = {}
+            for item in attempts:
+                stage = str(item.get("stage") or "unknown")
+                stages[stage] = stages.get(stage, 0) + 1
+            oldest = max((now - float(item.get("last_heartbeat_at") or now) for item in attempts), default=0)
             return {
                 "stop_requested": self._stop_requested,
                 "pending_skip_requests": self._pending_skip_requests,
                 "active_attempts": len(self._active_attempt_ids),
                 "targeted_skip_attempts": len(self._skip_active_attempt_ids),
+                "attempt_stage_counts": stages,
+                "oldest_attempt_heartbeat_seconds": int(oldest),
+                "attempts": attempts,
             }
 
 

@@ -141,6 +141,22 @@ class TopCountryTests(unittest.TestCase):
             self.assertIsNone(self.provider.get_best_country())
 
 
+class ExpiredActivationCleanupTests(unittest.TestCase):
+    def test_watchdog_cancels_only_expired_unreceived_codes(self):
+        provider = SmsActivateProvider(api_key="watchdog-key")
+        identity = provider._cleanup_identity()
+        with mock.patch("services.sms_service._load_activation_journal", return_value={
+            "expired": {"provider": identity, "activation_id": "expired", "sms_deadline_at": 1, "state": "sms_sent"},
+            "received": {"provider": identity, "activation_id": "received", "sms_deadline_at": 1, "state": "otp_submitted"},
+            "fresh": {"provider": identity, "activation_id": "fresh", "sms_deadline_at": 9999999999, "state": "rented"},
+        }), mock.patch("services.sms_service.create_sms_provider", return_value=provider), \
+             mock.patch.object(provider, "cancel", return_value=True) as cancel:
+            count = sms_service.cancel_expired_sms_activations({"sms_api_key": "watchdog-key"})
+
+        self.assertEqual(count, 1)
+        cancel.assert_called_once_with("expired")
+
+
 class ProviderRequestTests(unittest.TestCase):
     def test_balance_parsing(self):
         provider = SmsActivateProvider(api_key="k")
@@ -556,6 +572,25 @@ class PhoneCallbackControllerTests(unittest.TestCase):
         controller.get_code()
 
         self.assertTrue(controller.completed)
+
+    def test_sms_wait_over_four_minutes_cancels_and_releases_activation(self):
+        controller = self._controller(country="52")
+        provider = mock.Mock(spec=SmsActivateProvider)
+        provider.get_number.return_value = SmsActivation(
+            activation_id="timeout-1", phone_number="+66123", country="52"
+        )
+        provider.get_code.return_value = ""
+        controller.provider = provider
+        controller._resolve_country_candidates = lambda _provider: ["52"]
+
+        # 租号成功在 monotonic=100；第二次等码时已经超过绝对 240 秒期限。
+        with mock.patch("services.sms_service.time.monotonic", side_effect=[100.0, 341.0, 341.0]):
+            controller.get_phone()
+            self.assertEqual(controller.get_code(timeout=180), "")
+
+        provider.cancel.assert_called_once_with("timeout-1")
+        self.assertIsNone(controller.activation)
+        self.assertTrue(any("自动取消并申请退款" in line for line in self.logs))
 
     def test_get_code_requires_a_rented_number(self):
         controller = self._controller()

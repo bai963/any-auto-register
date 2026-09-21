@@ -28,6 +28,9 @@ except ArgumentError as exc:
     raise RuntimeError("DATABASE_URL 格式无效，请使用 SQLite 或 PostgreSQL SQLAlchemy URL") from exc
 
 _database_backend = _database_url.get_backend_name()
+# 注册 worker 的硬上限随数据库的并发写入能力而定。不要仅依赖调用方的
+# concurrency 参数，否则 SQLite 会被误配成 200 个并发写入者。
+DATABASE_REGISTER_CONCURRENCY_CAP = 200 if _database_backend == "postgresql" else 40
 if _database_backend not in {"sqlite", "postgresql"}:
     raise RuntimeError(
         f"不支持的数据库类型: {_database_backend}。当前仅支持 SQLite 和 PostgreSQL。"

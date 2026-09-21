@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 
 SMS_DEFAULT_SERVICE = "dr"
 SMS_DEFAULT_COUNTRY = "52"  # 泰国 —— OpenAI 走纯 SMS 的稳定国家
+# 从接码平台成功租到号码起算；超过此期限仍未收到验证码就必须取消并申请退款。
+SMS_WAIT_TIMEOUT_SECONDS = 240
+SMS_HTTP_TIMEOUT = (5, 15)  # connect, read；任何接码 HTTP 都不能无限阻塞
 
 # OpenAI 走纯 SMS 的国家白名单（截至 2025-2026 实测；其它国家会抽到 WhatsApp 号）
 OPENAI_SMS_COUNTRIES = {"52"}
@@ -388,6 +391,9 @@ class SmsActivateProvider(BaseSmsProvider):
                 "phone_number": activation.phone_number,
                 "country": activation.country,
                 "state": state,
+                # Activation recovery needs an absolute wall-clock deadline after restart.
+                "rented_at": time.time(),
+                "sms_deadline_at": time.time() + SMS_WAIT_TIMEOUT_SECONDS,
                 "created_at": time.time(),
                 "updated_at": time.time(),
             }
@@ -421,48 +427,65 @@ class SmsActivateProvider(BaseSmsProvider):
             self._forget_activation(str(item.get("activation_id") or ""))
 
     def _retry_pending_cleanup(self) -> None:
-        """处理当前 API Key 对应的遗留 activation；每次初始化最多重试 20 条。"""
+        """处理遗留 activation；网络 I/O 必须在 cleanup 锁外。
+
+        上次卡死时，40 个手机号 worker 在有 cancel 遗留项后同时静默。这里绝不能
+        持有 ``_SMS_CLEANUP_LOCK`` 调供应商 API，否则一个慢请求会堵住所有新 worker。
+        """
         identity = self._cleanup_identity()
+        now = time.time()
         with _SMS_CLEANUP_LOCK:
             items = _load_cleanup_queue()
-            retained: list[dict] = []
-            processed = 0
+            claimed: list[dict] = []
             for item in items:
+                if len(claimed) >= 20 or item.get("provider") != identity:
+                    continue
                 attempts = int(item.get("attempts") or 0)
-                next_retry_at = float(item.get("next_retry_at") or 0)
-                if item.get("provider") != identity or processed >= 20 or next_retry_at > time.time():
+                if attempts >= 6 or float(item.get("next_retry_at") or 0) > now:
+                    continue
+                # 同进程的其它 provider 初始化时看见此值会跳过，避免重复退款。
+                item["next_retry_at"] = now + 30
+                item["updated_at"] = now
+                claimed.append(dict(item))
+            _save_cleanup_queue(items)
+
+        for claimed_item in claimed:
+            activation_id = str(claimed_item.get("activation_id") or "")
+            action = str(claimed_item.get("action") or "cancel")
+            try:
+                if action == "finish":
+                    response = self._request({"action": "finishActivation", "id": activation_id})
+                    ok = response.status_code in (200, 204) or "ACCESS" in response.text
+                else:
+                    response = self._request({"action": "setStatus", "id": activation_id, "status": 8})
+                    ok = response.status_code in (200, 204) or "ACCESS_CANCEL" in response.text
+            except Exception:
+                ok = False
+
+            with _SMS_CLEANUP_LOCK:
+                items = _load_cleanup_queue()
+                retained: list[dict] = []
+                for item in items:
+                    same = (item.get("provider") == identity and
+                            str(item.get("activation_id") or "") == activation_id and
+                            item.get("action") == action)
+                    if not same:
+                        retained.append(item)
+                        continue
+                    if ok:
+                        logger.info("接码遗留清理成功: activation_id=%s action=%s", activation_id, action)
+                        continue
+                    attempts = int(item.get("attempts") or 0) + 1
+                    item["attempts"] = attempts
+                    item["updated_at"] = time.time()
+                    retry_delays = (10, 30, 120, 600, 1800, 3600)
+                    item["next_retry_at"] = time.time() + retry_delays[min(attempts - 1, len(retry_delays) - 1)]
                     retained.append(item)
-                    continue
-                if attempts >= 6:
-                    logger.error("接码清理重试已达上限，保留待人工处理: activation_id=%s action=%s", item.get("activation_id"), item.get("action"))
-                    retained.append(item)
-                    continue
-                processed += 1
-                activation_id = str(item.get("activation_id") or "")
-                action = str(item.get("action") or "cancel")
-                try:
-                    if action == "finish":
-                        response = self._request({"action": "finishActivation", "id": activation_id})
-                        ok = response.status_code in (200, 204) or "ACCESS" in response.text
-                    else:
-                        response = self._request({"action": "setStatus", "id": activation_id, "status": 8})
-                        ok = response.status_code in (200, 204) or "ACCESS_CANCEL" in response.text
-                except Exception:
-                    ok = False
-                if ok:
-                    logger.info("接码遗留清理成功: activation_id=%s action=%s", activation_id, action)
-                    continue
-                item["attempts"] = attempts + 1
-                item["updated_at"] = time.time()
-                # 10s, 30s, 2m, 10m, 30m, 1h 指数退避，避免失败时刷爆接码 API。
-                retry_delays = (10, 30, 120, 600, 1800, 3600)
-                item["next_retry_at"] = time.time() + retry_delays[min(item["attempts"] - 1, len(retry_delays) - 1)]
-                retained.append(item)
-            _save_cleanup_queue(retained)
+                _save_cleanup_queue(retained)
 
     # ── HTTP ──
 
-    def _request(self, params: dict, *, needs_key: bool = True, timeout: int = 30):
+    def _request(self, params: dict, *, needs_key: bool = True, timeout=SMS_HTTP_TIMEOUT):
         payload = dict(params)
         if needs_key:
             payload["api_key"] = self.api_key
@@ -930,6 +953,37 @@ class SmsActivateProvider(BaseSmsProvider):
         self.cancel(activation_id)
 
 
+def cancel_expired_sms_activations(config: dict, *, proxy: Optional[str] = None) -> int:
+    """父 watchdog 杀掉卡死注册子进程后，补偿其超过 4 分钟的未收码号码。
+
+    activation journal 是跨进程的事实来源；只取消仍未收到/提交验证码的号码。
+    网络请求由 provider 在 cleanup 锁外完成，失败会进入持久化重试队列。
+    """
+    settings = dict(config or {})
+    if proxy and not settings.get("sms_proxy"):
+        settings["sms_proxy"] = proxy
+    key = str(settings.get("sms_provider") or "smsbower")
+    try:
+        provider = create_sms_provider(key, settings)
+    except Exception:
+        logger.warning("watchdog 无法初始化接码 provider，保留 activation 待下次恢复", exc_info=True)
+        return 0
+    identity = provider._cleanup_identity() if isinstance(provider, SmsActivateProvider) else ""
+    now = time.time()
+    with _SMS_CLEANUP_LOCK:
+        items = _load_activation_journal()
+        expired = [
+            str(item.get("activation_id") or activation_id)
+            for activation_id, item in items.items()
+            if item.get("provider") == identity
+            and float(item.get("sms_deadline_at") or 0) <= now
+            and str(item.get("state") or "rented") in {"rented", "sms_sent", "waiting_code"}
+        ]
+    for activation_id in expired:
+        provider.cancel(activation_id)
+    return len(expired)
+
+
 def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
     """从配置创建 provider 实例。
 
@@ -980,6 +1034,7 @@ class PhoneCallbackController:
         self.completed = False
         self._verify_lock_acquired = False
         self._warned_off_whitelist = False
+        self._activation_rented_monotonic: Optional[float] = None
 
     def _ensure_provider(self) -> BaseSmsProvider:
         if self.provider is None:
@@ -1008,6 +1063,9 @@ class PhoneCallbackController:
             self._release_lock()
             raise
 
+        # Deadline starts when the provider has actually assigned an activation, not when
+        # the OpenAI flow later begins polling it.
+        self._activation_rented_monotonic = time.monotonic()
         used_country = self.activation.country or candidates[0]
         self.log(
             f"已租到号码: {self.activation.phone_number} "
@@ -1068,16 +1126,36 @@ class PhoneCallbackController:
         if not self.activation:
             raise RuntimeError("尚未租号，无法等待验证码")
         provider = self._ensure_provider()
-        self.log(
-            f"等待短信验证码…(activation_id={self.activation.activation_id} timeout={timeout}s)"
+        rented_at = self._activation_rented_monotonic
+        remaining = SMS_WAIT_TIMEOUT_SECONDS if rented_at is None else max(
+            0, int(SMS_WAIT_TIMEOUT_SECONDS - (time.monotonic() - rented_at))
         )
-        code = provider.get_code(self.activation.activation_id, timeout=timeout)
+        effective_timeout = min(max(0, int(timeout)), remaining)
+        self.log(
+            f"等待短信验证码…(activation_id={self.activation.activation_id} timeout={effective_timeout}s，"
+            f"租号后最多 {SMS_WAIT_TIMEOUT_SECONDS}s)"
+        )
+        code = provider.get_code(self.activation.activation_id, timeout=effective_timeout) if effective_timeout else ""
         if code:
             self.log(f"收到短信验证码: {code}")
             if getattr(provider, "auto_report_success_on_code", True):
                 self.report_success()
         else:
-            self.log(f"未收到短信验证码: activation_id={self.activation.activation_id}")
+            elapsed = 0 if rented_at is None else time.monotonic() - rented_at
+            if elapsed >= SMS_WAIT_TIMEOUT_SECONDS:
+                activation_id = self.activation.activation_id
+                self.log(
+                    f"等待短信超过 {SMS_WAIT_TIMEOUT_SECONDS}s，自动取消并申请退款: "
+                    f"activation_id={activation_id}"
+                )
+                # cancel() 自带持久化补偿队列；失败也绝不继续占着当前号码等待。
+                try:
+                    provider.cancel(activation_id)
+                finally:
+                    self.activation = None
+                    self._activation_rented_monotonic = None
+            else:
+                self.log(f"未收到短信验证码: activation_id={self.activation.activation_id}")
         return code
 
     def report_success(self) -> None:
@@ -1122,6 +1200,7 @@ class PhoneCallbackController:
                 # 无论平台请求是否抛异常，本次 activation 都不能再次使用；后续 cleanup
                 # 也不再对同一个 activation 发送第二次 cancel。
                 self.activation = None
+                self._activation_rented_monotonic = None
                 self._release_lock()
 
     def complete_activation(self, reason: str = "") -> None:
@@ -1143,6 +1222,7 @@ class PhoneCallbackController:
             except Exception:
                 pass
             self.activation = None
+            self._activation_rented_monotonic = None
         self._release_lock()
 
     def _release_lock(self) -> None:

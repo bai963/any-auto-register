@@ -5,7 +5,7 @@ from sqlmodel import Session, select
 from typing import Callable, Optional
 from copy import deepcopy
 from datetime import datetime, timezone
-from core.db import TaskLog, TaskRunModel, engine
+from core.db import DATABASE_REGISTER_CONCURRENCY_CAP, TaskLog, TaskRunModel, engine
 from core.task_runtime import (
     AttemptOutcome,
     AttemptResult,
@@ -18,7 +18,7 @@ from core.task_runtime import (
     global_openai_limiter,
     global_sms_limiter,
 )
-import time, json, asyncio, threading, logging
+import time, json, asyncio, threading, logging, multiprocessing, queue
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 logger = logging.getLogger(__name__)
@@ -45,6 +45,60 @@ DEFAULT_REGISTER_RETRY_TIMES = 1
 # 只用了一个号，凭它断定整个号源都被静默拦码证据太薄 —— 再开一轮确认一下，
 # 连着两轮同样结局才是真的号源问题，那时候继续只会多几个孤号。
 MAX_DEAD_END_ROUNDS = 2
+# 上次事故在最后日志后 11 分钟仍显示 40 个 active attempts；这些阈值让 UI 和
+# 运维日志在等待短信退款 deadline 之前就可见地告警，而非静默到人工发现。
+TASK_STALL_WARNING_SECONDS = 60
+TASK_STALL_DIAGNOSIS_SECONDS = 120
+# 子进程是线程无法强杀时的最终回收边界；手机号+绑定邮箱允许覆盖短信 240 秒和
+# 邮箱绑定余量，普通流程也不允许无限占住 40/200 worker 槽位。
+REGISTER_ATTEMPT_TIMEOUT_SECONDS = 300
+PHONE_REGISTER_ATTEMPT_TIMEOUT_SECONDS = 360
+PHONE_WITH_EMAIL_ATTEMPT_TIMEOUT_SECONDS = 480
+
+
+def _register_platform_child(payload: dict, result_queue) -> None:
+    """单账号平台注册子进程入口。只能使用可 pickle 的 payload。"""
+    try:
+        from core.base_mailbox import create_mailbox
+        from core.base_platform import RegisterConfig
+        from core.registry import get
+
+        config = RegisterConfig(
+            executor_type=payload["executor_type"],
+            captcha_solver=payload["captcha_solver"],
+            proxy=payload.get("proxy"),
+            extra=payload.get("extra") or {},
+        )
+        mailbox = create_mailbox(
+            provider=(payload.get("extra") or {}).get("mail_provider", "luckmail"),
+            extra=payload.get("extra") or {}, proxy=payload.get("proxy"),
+        )
+        platform = get(payload["platform"])(config=config, mailbox=mailbox)
+        platform._log_fn = lambda msg: result_queue.put(("log", str(msg)))
+        if getattr(platform, "mailbox", None) is not None:
+            platform.mailbox._log_fn = platform._log_fn
+        account = platform.register(email=payload.get("email") or None, password=payload.get("password"))
+        result_queue.put(("result", account))
+    except BaseException as exc:
+        result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _attempt_timeout_seconds(platform: str, extra: dict) -> int:
+    if platform == "chatgpt":
+        flow = str((extra or {}).get("chatgpt_register_flow") or "").strip().lower()
+        if flow == "phone_with_email":
+            return PHONE_WITH_EMAIL_ATTEMPT_TIMEOUT_SECONDS
+        if flow == "phone" or uses_sms_register_flow(extra):
+            return PHONE_REGISTER_ATTEMPT_TIMEOUT_SECONDS
+    return REGISTER_ATTEMPT_TIMEOUT_SECONDS
+
+
+def uses_sms_register_flow(extra: dict) -> bool:
+    """唯一的手机注册判定：phone_with_email 也必须占用接码预算。"""
+    extra = extra or {}
+    method = str(extra.get("register_method") or "").strip().lower()
+    flow = str(extra.get("chatgpt_register_flow") or "").strip().lower()
+    return method in {"phone", "sms"} or flow in {"phone", "phone_with_email"}
 
 
 def normalize_register_retry_times(value) -> int:
@@ -499,6 +553,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             time.sleep(chunk)
             remaining -= chunk
 
+    def _heartbeat(attempt_id: int | None, stage: str) -> None:
+        control.heartbeat(attempt_id, stage)
+
     try:
         PlatformCls = get(req.platform)
 
@@ -595,6 +652,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         def _do_one_round(i: int, round_no: int, rounds: int):
             nonlocal next_start_time
             _proxy = None
+            child = None
+            child_queue = None
             current_email = req.email or ""
             attempt_id: int | None = None
             concurrency_slot_acquired = False
@@ -612,11 +671,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 if req.platform == "chatgpt":
                     openai_slot_acquired = global_openai_limiter.acquire(control.is_stop_requested)
                 # 手机注册的接码 API 也需要独立预算；非手机流程不占用。
-                if str(_base_extra.get("register_method", "")).lower() in {"phone", "sms"}:
+                if uses_sms_register_flow(_base_extra):
                     sms_slot_acquired = global_sms_limiter.acquire(control.is_stop_requested)
                 control.checkpoint()
                 attempt_id = control.start_attempt()
                 control.checkpoint(attempt_id=attempt_id)
+                _heartbeat(attempt_id, "acquiring_proxy")
                 _proxy = normalize_proxy_url(_get_proxy())
                 if req.register_delay_seconds > 0:
                     with start_gate_lock:
@@ -643,23 +703,80 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     proxy=_proxy,
                     extra=merged_extra,
                 )
-                _mailbox = _build_mailbox(_proxy)
-                _platform = PlatformCls(config=_config, mailbox=_mailbox)
-                _platform._task_attempt_token = attempt_id
-                _platform._log_fn = lambda msg: _log(task_id, msg)
-                _platform.bind_task_control(control)
-                if getattr(_platform, "mailbox", None) is not None:
-                    _platform.mailbox._task_attempt_token = attempt_id
-                    _platform.mailbox._log_fn = _platform._log_fn
                 _task_store.set_progress(task_id, f"{i + 1}/{req.count}")
                 _persist_task_snapshot(task_id)
+                _heartbeat(attempt_id, "registering")
                 _log(task_id, f"开始注册第 {i + 1}/{req.count} 个账号{round_suffix}")
                 if _proxy:
                     _log(task_id, f"使用代理: {_proxy}")
-                account = _platform.register(
-                    email=req.email or None,
-                    password=req.password,
-                )
+
+                # Windows/线程模式下第三方 DNS、IMAP 或供应商库可永久卡住；注册主体
+                # 放进独立 spawn 子进程，父线程能在 deadline 后 terminate 并回收槽位。
+                _heartbeat(attempt_id, "platform_register")
+                try:
+                    child_context = multiprocessing.get_context("spawn")
+                    child_queue = child_context.Queue()
+                    child = child_context.Process(
+                        target=_register_platform_child,
+                        args=({
+                            "platform": req.platform, "executor_type": req.executor_type,
+                            "captcha_solver": req.captcha_solver, "proxy": _proxy,
+                            "extra": dict(merged_extra), "email": req.email, "password": req.password,
+                        }, child_queue), daemon=True,
+                    )
+                    child.start()
+                except OSError as exc:
+                    # 某些受限 Windows 会话（包括 CI）禁止 spawn。降级保留原线程链路，
+                    # 不能让注册因操作系统策略全部失败；正常服务进程仍使用子进程硬回收。
+                    _log(task_id, f"[SYSTEM] 子进程不可用，降级线程执行: {exc}")
+                    _heartbeat(attempt_id, "fallback_thread_register")
+                    _mailbox = _build_mailbox(_proxy)
+                    _platform = PlatformCls(config=_config, mailbox=_mailbox)
+                    _platform._task_attempt_token = attempt_id
+                    _platform._log_fn = lambda msg: (_heartbeat(attempt_id, "protocol"), _log(task_id, msg))[1]
+                    _platform.bind_task_control(control)
+                    if getattr(_platform, "mailbox", None) is not None:
+                        _platform.mailbox._task_attempt_token = attempt_id
+                        _platform.mailbox._log_fn = _platform._log_fn
+                    account = _platform.register(email=req.email or None, password=req.password)
+                    child = None
+                deadline = time.monotonic() + _attempt_timeout_seconds(req.platform, merged_extra)
+                account = locals().get("account", None)
+                child_error = ""
+                while child is not None and child.is_alive() and not account and not child_error:
+                    control.checkpoint(attempt_id=attempt_id)
+                    try:
+                        kind, value = child_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        _heartbeat(attempt_id, "child_register")
+                        if time.monotonic() >= deadline:
+                            from services.sms_service import cancel_expired_sms_activations
+                            cancelled = cancel_expired_sms_activations(merged_extra, proxy=_proxy)
+                            child.terminate()
+                            child.join(timeout=10)
+                            raise TimeoutError(
+                                f"单账号注册超过 {_attempt_timeout_seconds(req.platform, merged_extra)}s，"
+                                f"已终止子进程；超时接码取消 {cancelled} 个"
+                            )
+                        continue
+                    if kind == "log":
+                        _heartbeat(attempt_id, "protocol")
+                        _log(task_id, value)
+                    elif kind == "result":
+                        account = value
+                    else:
+                        child_error = str(value)
+                if child is not None:
+                    child.join(timeout=5)
+                    if child.is_alive():
+                        child.terminate()
+                        child.join(timeout=10)
+                if child_error:
+                    raise RuntimeError(child_error)
+                if account is None:
+                    raise RuntimeError(f"注册子进程异常退出（exitcode={child.exitcode if child else 'n/a'}）")
+                _heartbeat(attempt_id, "persisting_account")
+                _mailbox = None
                 current_email = account.email or current_email
                 # 手机号注册且没绑上邮箱时，account.email 存的是号码，没有域名可校验
                 if (
@@ -740,6 +857,16 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     email=current_email,
                 )
             finally:
+                # stop/skip 或父流程异常时也必须清理子进程，不能把孤儿进程留在
+                # 后台继续占用号码、代理和网络连接。
+                if child is not None and child.is_alive():
+                    child.terminate()
+                    child.join(timeout=10)
+                if child_queue is not None:
+                    try:
+                        child_queue.close()
+                    except Exception:
+                        pass
                 control.finish_attempt(attempt_id)
                 if _proxy:
                     _proxy_pool.release(_proxy)
@@ -755,9 +882,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 
         # 滑动窗口最多保留 max_workers 个 Future，避免大任务一次创建数万个 Future。
-        max_workers = min(req.concurrency, req.count)
+        # 数据库模式硬上限：PostgreSQL 200，SQLite 40。
+        max_workers = min(req.concurrency, req.count, DATABASE_REGISTER_CONCURRENCY_CAP)
         stopped = False
         next_index = 0
+        last_stall_notice_at = 0.0
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             pending = set()
 
@@ -772,7 +901,22 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             while len(pending) < max_workers and _submit_next():
                 pass
             while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                # 有完成项时立即处理；没有时每秒醒来一次检查心跳，避免复现上次 40
+                # 个 Future 无限 wait、页面只有 running 而没有任何诊断。
+                done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+                if not done:
+                    state = control.snapshot()
+                    active = int(state.get("active_attempts") or 0)
+                    stale = int(state.get("oldest_attempt_heartbeat_seconds") or 0)
+                    threshold = (TASK_STALL_DIAGNOSIS_SECONDS if stale >= TASK_STALL_DIAGNOSIS_SECONDS
+                                 else TASK_STALL_WARNING_SECONDS)
+                    now = time.monotonic()
+                    if active and stale >= threshold and now - last_stall_notice_at >= 30:
+                        level = "疑似卡死" if stale >= TASK_STALL_DIAGNOSIS_SECONDS else "心跳告警"
+                        _log(task_id, f"[SYSTEM] {level}: active_attempts={active}，"
+                             f"最长无心跳 {stale}s，阶段={state.get('attempt_stage_counts') or {}}")
+                        last_stall_notice_at = now
+                    continue
                 for future in done:
                     try:
                         result = future.result()
