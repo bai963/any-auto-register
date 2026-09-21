@@ -64,7 +64,7 @@ export function TaskLogPanel({ taskId, onDone, kind = 'register', operation }: T
       : operation === 'pay'
         ? { success: '支付成功', registered: '已处理', total: '总共账号', done: '支付任务完成' }
         : { success: '操作成功', registered: '已处理', total: '总共账号', done: '支付任务完成' })
-    : KIND_TEXT[kind]
+    : (KIND_TEXT[kind] ?? KIND_TEXT.register)
   const [lines, setLines] = useState<string[]>([])
   const [summary, setSummary] = useState<RegisterSummary>({ success: 0, registered: 0, total: 0 })
   const [error, setError] = useState('')

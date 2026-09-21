@@ -728,7 +728,7 @@ export default function Accounts() {
   const [platformActions, setPlatformActions] = useState<any[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(50)
+  const [pageSize, setPageSize] = useState(100)
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
@@ -1601,12 +1601,25 @@ export default function Accounts() {
         columns={columns}
         dataSource={accounts}
         loading={loading}
-        size="middle"
+        size="small"
         rowSelection={{
           selectedRowKeys,
           onChange: setSelectedRowKeys,
         }}
-        pagination={{ total, current: page, pageSize, showSizeChanger: true, pageSizeOptions: ['20', '50', '100'], onChange: (p, ps) => { setPage(p); setPageSize(ps) } }}
+        pagination={{
+          total,
+          current: page,
+          pageSize,
+          // ChatGPT 账号量通常较大：分页固定放在表格右上方，避免查看时还要滚到表底。
+          position: isChatgptPlatform ? ['topRight'] : ['bottomRight'],
+          showSizeChanger: true,
+          pageSizeOptions: isChatgptPlatform ? ['50', '100', '200', '500', '1000'] : ['20', '50', '100'],
+          showTotal: (count, range) => `${range[0]}-${range[1]} / ${count}`,
+          onChange: (nextPage, nextPageSize) => {
+            setPage(nextPage)
+            setPageSize(nextPageSize)
+          },
+        }}
         scroll={{ x: isChatgptPlatform ? 1300 : 980 }}
         onRow={(record) => ({
           onDoubleClick: () => {

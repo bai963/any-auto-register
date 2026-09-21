@@ -143,7 +143,7 @@ function AppContent() {
   ]
 
   return (
-    <ConfigProvider theme={currentTheme} locale={zhCN}>
+    <ConfigProvider theme={currentTheme} locale={zhCN} componentSize="small">
       <AntdApp>
       <Layout style={{ minHeight: '100vh' }}>
         <Sider

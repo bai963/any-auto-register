@@ -60,6 +60,14 @@ const STATUS_CONFIG: Record<string, { color: string; label: string; icon?: React
   stopped: { color: 'warning', label: '已停止' },
 }
 
+// TaskRun.source 还会是 manual / api / schedule，它们不是 TaskLogPanel 的任务类型。
+// 不能直接断言，否则打开这类任务日志时 KIND_TEXT[kind] 为 undefined，渲染会白屏。
+function getTaskLogKind(source: string | undefined): TaskKind {
+  return source === 'backfill_rt' || source === 'bind_2fa' || source === 'payment'
+    ? source
+    : 'register'
+}
+
 function toUnixSeconds(value: unknown): number | null {
   if (value === null || value === undefined) return null
   if (typeof value === 'string') {
@@ -331,7 +339,7 @@ export default function RunningTasks() {
         destroyOnClose
         bodyStyle={{ padding: 16 }}
       >
-        {logTaskId && <TaskLogPanel taskId={logTaskId} kind={(logTask?.source || 'register') as TaskKind} />}
+        {logTaskId && <TaskLogPanel taskId={logTaskId} kind={getTaskLogKind(logTask?.source)} />}
       </Drawer>
     </div>
   )
