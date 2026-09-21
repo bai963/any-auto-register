@@ -170,7 +170,7 @@ OpenAI asks some registrations to bind a phone number. When add-phone is hit, th
 | Service code | Providers track stock per service code; OpenAI maps to `dr` |
 | Default country ID | Defaults to `52` (Thailand) |
 | Auto-pick best country | Picks by ascending price plus stock; an allow-list can restrict the candidates |
-| Reuse the same number | Reuses a number within its 20-minute lease until the per-number success cap is reached |
+| Number allocation | Each registration rents a separate number; previously rented numbers are never reused |
 | Per-number timeout / max number swaps / code retries per number | Retry policy when a code does not arrive |
 
 "Query country ranking" lists price and stock per country for the given service code; green tags mark countries where OpenAI still uses plain SMS.

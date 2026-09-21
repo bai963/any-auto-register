@@ -14,7 +14,7 @@ DATABASE_URL=postgresql+psycopg://any_auto_register:请替换强密码@127.0.0.1
 
 ## 200 并发任务配置
 
-注册、补 RT 和绑 2FA 的单任务上限为 200；同一应用进程内所有这类任务共享 `TASK_GLOBAL_MAX_CONCURRENCY`（默认 200）的总预算。SQLite 最多允许 10 并发，高于此值必须使用 PostgreSQL。
+注册、补 RT 和绑 2FA 的单任务上限为 200；同一应用进程内所有这类任务共享 `TASK_GLOBAL_MAX_CONCURRENCY`（默认 200）的总预算。SQLite 最多允许 40 并发，高于此值必须使用 PostgreSQL。
 
 PostgreSQL 默认连接池为 `DB_POOL_SIZE=30`、`DB_MAX_OVERFLOW=50`、`DB_POOL_TIMEOUT=30`。网络任务绝大部分时间都在等待外部服务，不需要把数据库连接数设为 200。
 

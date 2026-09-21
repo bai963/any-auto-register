@@ -1715,7 +1715,7 @@ export default function Accounts() {
               label="并发数"
               initialValue={1}
               rules={[{ required: true }]}
-              extra="最高 200；超过 10 并发需配置 PostgreSQL。高并发建议使用独立代理，并注意邮箱与 OpenAI 的限流/风控。"
+              extra="最高 200；超过 40 并发需配置 PostgreSQL。高并发建议使用独立代理，并注意邮箱与 OpenAI 的限流/风控。"
             >
               <InputNumber min={1} max={200} precision={0} style={{ width: '100%' }} />
             </Form.Item>
@@ -1807,7 +1807,7 @@ export default function Accounts() {
                 name="concurrency"
                 label="并发数"
                 initialValue={1}
-                extra="最高 200；超过 10 并发需配置 PostgreSQL。高并发会增加 OpenAI 风控风险，建议设置间隔为 0 前确认代理资源充足。"
+                extra="最高 200；超过 40 并发需配置 PostgreSQL。高并发会增加 OpenAI 风控风险，建议设置间隔为 0 前确认代理资源充足。"
               >
                 <InputNumber min={1} max={200} precision={0} style={{ width: '100%' }} />
               </Form.Item>

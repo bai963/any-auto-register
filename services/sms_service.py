@@ -24,6 +24,7 @@ import json
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 SMS_DEFAULT_SERVICE = "dr"
 SMS_DEFAULT_COUNTRY = "52"  # 泰国 —— OpenAI 走纯 SMS 的稳定国家
-SMS_PHONE_LIFETIME = 20 * 60  # 号码租用窗口（秒）
 
 # OpenAI 走纯 SMS 的国家白名单（截至 2025-2026 实测；其它国家会抽到 WhatsApp 号）
 OPENAI_SMS_COUNTRIES = {"52"}
@@ -51,9 +51,27 @@ SMS_PROVIDERS: dict[str, dict[str, str]] = {
     },
 }
 
-_SMS_CACHE_LOCK = threading.Lock()
-_SMS_VERIFY_LOCK = threading.RLock()
-_SMS_CACHE: Optional[dict] = None  # 跨线程共享的号码复用缓存
+def _sms_limit(name: str, default: int) -> int:
+    import os
+    try:
+        return max(1, min(int(os.getenv(name, str(default))), 200))
+    except ValueError:
+        return default
+
+
+_SMS_RENT_SEMAPHORE = threading.BoundedSemaphore(_sms_limit("SMS_RENT_MAX_CONCURRENCY", 5))
+_SMS_POLL_SEMAPHORE = threading.BoundedSemaphore(_sms_limit("SMS_POLL_MAX_CONCURRENCY", 30))
+_SMS_CLOSE_SEMAPHORE = threading.BoundedSemaphore(_sms_limit("SMS_CLOSE_MAX_CONCURRENCY", 10))
+
+
+@contextmanager
+def _sms_slot(kind: str):
+    semaphore = {"rent": _SMS_RENT_SEMAPHORE, "poll": _SMS_POLL_SEMAPHORE, "close": _SMS_CLOSE_SEMAPHORE}[kind]
+    semaphore.acquire()
+    try:
+        yield
+    finally:
+        semaphore.release()
 
 
 @dataclass
@@ -111,20 +129,28 @@ class BaseSmsProvider(ABC):
             "成功" if ok else "失败",
             (reason or "业务验证完成")[:80],
         )
+        if ok:
+            forget = getattr(self, "_forget_activation", None)
+            if callable(forget):
+                forget(activation_id)
+        if not ok:
+            enqueue = getattr(self, "_enqueue_cleanup", None)
+            if callable(enqueue):
+                enqueue(activation_id, "finish", reason or "业务验证完成")
         return ok
 
     def report_success(self, activation_id: str) -> bool:
-        """业务侧验证通过后调用，平台据此结算并允许复用。"""
+        """业务侧验证通过后调用，平台据此结算。"""
         return True
 
     def mark_code_failed(self, activation_id: str, reason: str = "") -> None:
         """业务侧收到码但 validate 失败 → 记下这个码，别再拿它去验。"""
 
     def mark_send_failed(self, activation_id: str, reason: str = "") -> None:
-        """业务侧拒绝该手机号（add-phone/send 返错）→ 停止复用并退款。"""
+        """业务侧拒绝该手机号（add-phone/send 返错）→ 取消并退款。"""
 
-    def stop_reuse(self, activation_id: str, reason: str = "") -> None:
-        """号已经被业务侧占用（注册出账号了）→ 不再复用，但也不退款。"""
+    def complete_activation(self, activation_id: str, reason: str = "") -> None:
+        """号码已被业务侧占用，结束 activation，不能走退款。"""
 
     def mark_send_succeeded(self, activation_id: str) -> None:
         """业务侧已成功触发短信发送（add-phone/send 200）。"""
@@ -205,10 +231,48 @@ def _safe_bool(value, default: bool) -> bool:
     return str(value).strip().lower() not in {"0", "false", "no", "off", "否"}
 
 
-def _cache_file() -> Path:
+_SMS_CLEANUP_LOCK = threading.Lock()
+
+
+def _cleanup_queue_file() -> Path:
     cache_dir = Path(__file__).resolve().parents[1] / "data"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / ".sms_phone_cache.json"
+    return cache_dir / ".sms_activation_cleanup_queue.json"
+
+
+def _load_cleanup_queue() -> list[dict]:
+    try:
+        raw = json.loads(_cleanup_queue_file().read_text(encoding="utf-8"))
+        return raw if isinstance(raw, list) else []
+    except Exception:
+        return []
+
+
+def _save_cleanup_queue(items: list[dict]) -> None:
+    path = _cleanup_queue_file()
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(path)
+
+def _activation_journal_file() -> Path:
+    cache_dir = Path(__file__).resolve().parents[1] / "data"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / ".sms_activation_journal.json"
+
+
+def _load_activation_journal() -> dict[str, dict]:
+    try:
+        raw = json.loads(_activation_journal_file().read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_activation_journal(items: dict[str, dict]) -> None:
+    path = _activation_journal_file()
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(path)
 
 
 # getStatusV2 的数字状态：8 = 已取消
@@ -261,7 +325,7 @@ class SmsActivateProvider(BaseSmsProvider):
     """sms-activate 协议系 provider（SmsBower / HeroSMS 共用）。"""
 
     DEFAULT_BASE_URL = SMS_PROVIDERS["smsbower"]["base_url"]
-    auto_report_success_on_code = False  # 等业务侧确认才报成功，便于号码复用
+    auto_report_success_on_code = False  # 等业务侧确认后才结算 activation
 
     def __init__(
         self,
@@ -273,8 +337,6 @@ class SmsActivateProvider(BaseSmsProvider):
         max_price: float = -1,
         fixed_price: float = -1,
         proxy: Optional[str] = None,
-        reuse_phone_to_max: bool = True,
-        phone_success_max: int = 3,
     ):
         self.api_key = str(api_key or "").strip()
         self.base_url = str(base_url or "").strip() or self.DEFAULT_BASE_URL
@@ -286,11 +348,117 @@ class SmsActivateProvider(BaseSmsProvider):
         self.fixed_price = -1.0
         self._proxy = (proxy or "").strip() or None
         self._proxies = {"http": self._proxy, "https": self._proxy} if self._proxy else None
-        self.reuse_phone_to_max = bool(reuse_phone_to_max)
-        self.phone_success_max = max(0, int(phone_success_max or 0))
         self.last_code_result: Optional[dict] = None
+        self._used_codes: dict[str, set[str]] = {}
         self.current_activation: Optional[SmsActivation] = None
         self._warned_low_bid = False
+        # 进程重启后继续处理上次未完成的 cancel / finish，避免 activation 只等平台自然过期。
+        self._recover_activation_journal()
+        self._retry_pending_cleanup()
+
+    def _cleanup_identity(self) -> str:
+        return _hash_secret(f"{self.base_url}|{self.api_key}")
+
+    def _enqueue_cleanup(self, activation_id: str, action: str, reason: str) -> None:
+        """将失败的结算/退款写入本地队列，后续启动或下次使用接码时自动重试。"""
+        with _SMS_CLEANUP_LOCK:
+            items = _load_cleanup_queue()
+            key = (self._cleanup_identity(), str(activation_id), action)
+            for item in items:
+                if (item.get("provider"), item.get("activation_id"), item.get("action")) == key:
+                    item["reason"] = reason[:300]
+                    item["updated_at"] = time.time()
+                    item["next_retry_at"] = min(float(item.get("next_retry_at") or time.time()), time.time())
+                    _save_cleanup_queue(items)
+                    return
+            items.append({
+                "provider": key[0], "activation_id": key[1], "action": action,
+                "reason": reason[:300], "attempts": 0, "created_at": time.time(),
+                "updated_at": time.time(), "next_retry_at": time.time(),
+            })
+            _save_cleanup_queue(items)
+        logger.warning("接码清理已进入重试队列: activation_id=%s action=%s", activation_id, action)
+
+    def _track_activation(self, activation: SmsActivation, state: str = "rented") -> None:
+        with _SMS_CLEANUP_LOCK:
+            items = _load_activation_journal()
+            items[str(activation.activation_id)] = {
+                "provider": self._cleanup_identity(),
+                "activation_id": str(activation.activation_id),
+                "phone_number": activation.phone_number,
+                "country": activation.country,
+                "state": state,
+                "created_at": time.time(),
+                "updated_at": time.time(),
+            }
+            _save_activation_journal(items)
+
+    def _set_activation_state(self, activation_id: str, state: str) -> None:
+        with _SMS_CLEANUP_LOCK:
+            items = _load_activation_journal()
+            item = items.get(str(activation_id))
+            if item:
+                item["state"] = state
+                item["updated_at"] = time.time()
+                _save_activation_journal(items)
+
+    def _forget_activation(self, activation_id: str) -> None:
+        with _SMS_CLEANUP_LOCK:
+            items = _load_activation_journal()
+            if items.pop(str(activation_id), None) is not None:
+                _save_activation_journal(items)
+
+    def _recover_activation_journal(self) -> None:
+        """重启后将未关闭 activation 转入 cancel/finish 重试队列。"""
+        with _SMS_CLEANUP_LOCK:
+            items = _load_activation_journal()
+            ours = [item for item in items.values() if item.get("provider") == self._cleanup_identity()]
+        for item in ours:
+            state = str(item.get("state") or "rented")
+            # otp_submitted 的请求可能已被 OpenAI 接受，宁可结算也不能错误退款。
+            action = "finish" if state in {"otp_submitted", "phone_verified", "account_created"} else "cancel"
+            self._enqueue_cleanup(str(item.get("activation_id") or ""), action, f"进程重启恢复: {state}")
+            self._forget_activation(str(item.get("activation_id") or ""))
+
+    def _retry_pending_cleanup(self) -> None:
+        """处理当前 API Key 对应的遗留 activation；每次初始化最多重试 20 条。"""
+        identity = self._cleanup_identity()
+        with _SMS_CLEANUP_LOCK:
+            items = _load_cleanup_queue()
+            retained: list[dict] = []
+            processed = 0
+            for item in items:
+                attempts = int(item.get("attempts") or 0)
+                next_retry_at = float(item.get("next_retry_at") or 0)
+                if item.get("provider") != identity or processed >= 20 or next_retry_at > time.time():
+                    retained.append(item)
+                    continue
+                if attempts >= 6:
+                    logger.error("接码清理重试已达上限，保留待人工处理: activation_id=%s action=%s", item.get("activation_id"), item.get("action"))
+                    retained.append(item)
+                    continue
+                processed += 1
+                activation_id = str(item.get("activation_id") or "")
+                action = str(item.get("action") or "cancel")
+                try:
+                    if action == "finish":
+                        response = self._request({"action": "finishActivation", "id": activation_id})
+                        ok = response.status_code in (200, 204) or "ACCESS" in response.text
+                    else:
+                        response = self._request({"action": "setStatus", "id": activation_id, "status": 8})
+                        ok = response.status_code in (200, 204) or "ACCESS_CANCEL" in response.text
+                except Exception:
+                    ok = False
+                if ok:
+                    logger.info("接码遗留清理成功: activation_id=%s action=%s", activation_id, action)
+                    continue
+                item["attempts"] = attempts + 1
+                item["updated_at"] = time.time()
+                # 10s, 30s, 2m, 10m, 30m, 1h 指数退避，避免失败时刷爆接码 API。
+                retry_delays = (10, 30, 120, 600, 1800, 3600)
+                item["next_retry_at"] = time.time() + retry_delays[min(item["attempts"] - 1, len(retry_delays) - 1)]
+                retained.append(item)
+            _save_cleanup_queue(retained)
 
     # ── HTTP ──
 
@@ -298,9 +466,13 @@ class SmsActivateProvider(BaseSmsProvider):
         payload = dict(params)
         if needs_key:
             payload["api_key"] = self.api_key
-        resp = requests.get(self.base_url, params=payload, timeout=timeout, proxies=self._proxies)
-        resp.raise_for_status()
-        return resp
+        action = str(payload.get("action") or "")
+        kind = "rent" if action in {"getNumber", "getNumberV2"} else "close" if action in {"cancelActivation", "finishActivation", "setStatus"} else "poll"
+        # 只限制 API 请求本身；worker 等短信时不会占着限流槽位。
+        with _sms_slot(kind):
+            response = requests.get(self.base_url, params=payload, timeout=timeout, proxies=self._proxies)
+        response.raise_for_status()
+        return response
 
     # ── 余额 / 价格 / 国家 ──
 
@@ -445,62 +617,6 @@ class SmsActivateProvider(BaseSmsProvider):
 
         return _pick(min_stock) or _pick(1)
 
-    # ── 号码复用缓存 ──
-
-    def _cache_identity(self, service: str, country: str) -> dict:
-        return {
-            "api_key_hash": _hash_secret(self.api_key),
-            "service": str(service),
-            "country": str(country),
-        }
-
-    def _load_cache(self, service: str, country: str) -> Optional[dict]:
-        global _SMS_CACHE
-        cache = _SMS_CACHE
-        if cache is None:
-            path = _cache_file()
-            if not path.exists():
-                return None
-            try:
-                cache = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                return None
-
-        identity = self._cache_identity(service, country)
-        if any(str(cache.get(k) or "") != str(v) for k, v in identity.items()):
-            return None
-
-        elapsed = time.time() - float(cache.get("acquired_at") or 0)
-        if elapsed >= SMS_PHONE_LIFETIME or cache.get("reuse_stopped"):
-            self._clear_cache()
-            return None
-        if self.phone_success_max > 0 and int(cache.get("use_count") or 0) >= self.phone_success_max:
-            cache["reuse_stopped"] = True
-            cache["stop_reason"] = f"已达单号复用上限 ({self.phone_success_max})"
-            self._save_cache(cache)
-            return None
-
-        cache["used_codes"] = set(cache.get("used_codes") or [])
-        _SMS_CACHE = cache
-        return cache
-
-    def _save_cache(self, cache: Optional[dict]) -> None:
-        global _SMS_CACHE
-        _SMS_CACHE = cache
-        path = _cache_file()
-        if cache is None:
-            try:
-                path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return
-        serializable = dict(cache)
-        serializable["used_codes"] = sorted(serializable.get("used_codes") or [])
-        path.write_text(json.dumps(serializable, ensure_ascii=False), encoding="utf-8")
-
-    def _clear_cache(self) -> None:
-        self._save_cache(None)
-
     # ── 租号 ──
 
     def _request_number(self, action: str, service: str, country: str) -> dict:
@@ -565,72 +681,44 @@ class SmsActivateProvider(BaseSmsProvider):
                 str(country or self.default_country or SMS_DEFAULT_COUNTRY).strip()
             ]
 
-        with _SMS_VERIFY_LOCK, _SMS_CACHE_LOCK:
-            cache = (
-                self._load_cache(service_code, country_candidates[0])
-                if self.reuse_phone_to_max
-                else None
-            )
-            if cache and str(cache.get("country") or "") in country_candidates:
+        failures: list[str] = []
+        last_exc: Optional[Exception] = None
+        for cid in country_candidates:
+            cid = str(cid).strip()
+            if not cid:
+                continue
+            for action in ("getNumberV2", "getNumber"):
+                try:
+                    info = self._request_number(action, service_code, cid)
+                except Exception as exc:
+                    failures.append(f"{cid}: {action}={str(exc)[:120]}")
+                    last_exc = exc
+                    continue
+
+                activation_id = str(info.get("activationId") or "")
+                phone = self._format_phone(info)
+                if not activation_id or not phone.strip("+"):
+                    failures.append(f"{cid}: {action} 返回信息不完整")
+                    continue
+
                 activation = SmsActivation(
-                    activation_id=str(cache["activation_id"]),
-                    phone_number=str(cache["phone_number"]),
-                    country=str(cache.get("country") or country_candidates[0]),
-                    metadata={"reused": True, "use_count": int(cache.get("use_count") or 0)},
+                    activation_id=activation_id,
+                    phone_number=phone,
+                    country=cid,
+                    metadata={},
                 )
                 self.current_activation = activation
+                self._track_activation(activation, "rented")
+                if len(country_candidates) > 1:
+                    logger.info("在国家 %s 租到号 %s (action=%s)", cid, phone, action)
                 return activation
 
-            failures: list[str] = []
-            last_exc: Optional[Exception] = None
-            for cid in country_candidates:
-                cid = str(cid).strip()
-                if not cid:
-                    continue
-                for action in ("getNumberV2", "getNumber"):
-                    try:
-                        info = self._request_number(action, service_code, cid)
-                    except Exception as exc:
-                        failures.append(f"{cid}: {action}={str(exc)[:120]}")
-                        last_exc = exc
-                        continue
-
-                    activation_id = str(info.get("activationId") or "")
-                    phone = self._format_phone(info)
-                    if not activation_id or not phone.strip("+"):
-                        failures.append(f"{cid}: {action} 返回信息不完整")
-                        continue
-
-                    self._save_cache(
-                        {
-                            **self._cache_identity(service_code, cid),
-                            "country": cid,
-                            "activation_id": activation_id,
-                            "phone_number": phone,
-                            "acquired_at": time.time(),
-                            "use_count": 0,
-                            "used_codes": set(),
-                            "reuse_stopped": False,
-                            "stop_reason": "",
-                        }
-                    )
-                    activation = SmsActivation(
-                        activation_id=activation_id,
-                        phone_number=phone,
-                        country=cid,
-                        metadata={"reused": False},
-                    )
-                    self.current_activation = activation
-                    if len(country_candidates) > 1:
-                        logger.info("在国家 %s 租到号 %s (action=%s)", cid, phone, action)
-                    return activation
-
-            detail = " | ".join(failures) if failures else "未知"
-            if "NO_NUMBERS" in detail:
-                self._explain_no_numbers(service_code, country_candidates)
-            raise RuntimeError(
-                f"依次尝试 {len(country_candidates)} 个候选国家全部失败: {detail}"
-            ) from last_exc
+        detail = " | ".join(failures) if failures else "未知"
+        if "NO_NUMBERS" in detail:
+            self._explain_no_numbers(service_code, country_candidates)
+        raise RuntimeError(
+            f"依次尝试 {len(country_candidates)} 个候选国家全部失败: {detail}"
+        ) from last_exc
 
     def _explain_no_numbers(self, service: str, countries: list[str]) -> None:
         """NO_NUMBERS 多半不是没货，是出价太低 —— 把挂牌价查出来摆在日志里。
@@ -727,8 +815,7 @@ class SmsActivateProvider(BaseSmsProvider):
         """
         start = time.time()
         deadline = start + timeout
-        with _SMS_CACHE_LOCK:
-            used_codes = set((_SMS_CACHE or {}).get("used_codes") or [])
+        used_codes = self._used_codes.setdefault(str(activation_id), set())
 
         last_seen = ""
         next_report = start + 30
@@ -801,97 +888,46 @@ class SmsActivateProvider(BaseSmsProvider):
             resp = self._request({"action": "cancelActivation", "id": activation_id})
             ok = resp.status_code == 204 or "ACCESS_CANCEL" in resp.text
         except Exception:
-            ok = False
+            pass
         if not ok:
             try:
                 resp = self._request({"action": "setStatus", "id": activation_id, "status": 8})
                 ok = "ACCESS_CANCEL" in resp.text
             except Exception:
-                ok = False
-        with _SMS_CACHE_LOCK:
-            cache = _SMS_CACHE
-            if cache and str(cache.get("activation_id")) == str(activation_id):
-                self._clear_cache()
+                pass
+        self._used_codes.pop(str(activation_id), None)
+        if ok:
+            self._forget_activation(activation_id)
+        else:
+            self._enqueue_cleanup(activation_id, "cancel", "取消未使用号码")
         return ok
 
     def report_success(self, activation_id: str) -> bool:
-        with _SMS_CACHE_LOCK:
-            cache = _SMS_CACHE
-            should_finish = False
-            should_clear = False
-            if cache and str(cache.get("activation_id")) == str(activation_id):
-                cache["use_count"] = int(cache.get("use_count") or 0) + 1
-                if self.last_code_result and self.last_code_result.get("code"):
-                    used = set(cache.get("used_codes") or [])
-                    used.add(self.last_code_result["code"])
-                    cache["used_codes"] = used
-                remaining = SMS_PHONE_LIFETIME - (time.time() - float(cache.get("acquired_at") or 0))
-                if not self.reuse_phone_to_max:
-                    should_finish = should_clear = True
-                    cache["reuse_stopped"] = True
-                elif self.phone_success_max > 0 and int(cache["use_count"]) >= self.phone_success_max:
-                    should_finish = True
-                    cache["reuse_stopped"] = True
-                elif remaining <= 30:
-                    should_finish = should_clear = True
-                    cache["reuse_stopped"] = True
-                self._save_cache(cache)
-                if should_clear:
-                    self._clear_cache()
-            holds_cache = bool(cache and str(cache.get("activation_id")) == str(activation_id))
-
-        if not (should_finish or not holds_cache):
-            return True
+        self._set_activation_state(activation_id, "phone_verified")
+        self._used_codes.pop(str(activation_id), None)
         return self._finish_activation(activation_id, reason="手机号验证成功")
 
     def mark_code_failed(self, activation_id: str, reason: str = "") -> None:
-        with _SMS_CACHE_LOCK:
-            cache = _SMS_CACHE
-            if cache and str(cache.get("activation_id")) == str(activation_id):
-                if self.last_code_result and self.last_code_result.get("code"):
-                    used = set(cache.get("used_codes") or [])
-                    used.add(self.last_code_result["code"])
-                    cache["used_codes"] = used
-                self._save_cache(cache)
+        if self.last_code_result and self.last_code_result.get("code"):
+            self._used_codes.setdefault(str(activation_id), set()).add(
+                str(self.last_code_result["code"])
+            )
 
     def mark_send_succeeded(self, activation_id: str) -> None:
+        self._set_activation_state(activation_id, "sms_sent")
         try:
             self._request({"action": "setStatus", "id": activation_id, "status": 1})
         except Exception:
             pass
 
-    def stop_reuse(self, activation_id: str, reason: str = "") -> None:
-        # OpenAI 已创建账号或已接受手机号：不能 cancel（那是退款路径），必须结算。
-        with _SMS_CACHE_LOCK:
-            cache = _SMS_CACHE
-            if cache and str(cache.get("activation_id")) == str(activation_id):
-                cache["reuse_stopped"] = True
-                cache["stop_reason"] = reason or "号码已被业务侧占用"
-                self._save_cache(cache)
-                self._clear_cache()
+    def complete_activation(self, activation_id: str, reason: str = "") -> None:
+        self._set_activation_state(activation_id, "account_created")
+        self._used_codes.pop(str(activation_id), None)
         self._finish_activation(activation_id, reason=reason or "手机号已被业务侧占用")
 
     def mark_send_failed(self, activation_id: str, reason: str = "") -> None:
         # 业务侧拒了这个号 → cancel 退款，号根本没用上，不能白花钱
-        cancelled = False
-        try:
-            resp = self._request({"action": "setStatus", "id": activation_id, "status": 8})
-            cancelled = "ACCESS_CANCEL" in resp.text or resp.status_code in (200, 204)
-        except Exception:
-            cancelled = False
-        logger.info(
-            "号 activation_id=%s 退款%s（原因: %s）",
-            activation_id,
-            "成功" if cancelled else "失败",
-            (reason or "未知原因")[:80],
-        )
-        with _SMS_CACHE_LOCK:
-            cache = _SMS_CACHE
-            if cache and str(cache.get("activation_id")) == str(activation_id):
-                cache["reuse_stopped"] = True
-                cache["stop_reason"] = reason or "号码被业务侧拒绝"
-                self._save_cache(cache)
-                self._clear_cache()
+        self.cancel(activation_id)
 
 
 def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
@@ -917,8 +953,6 @@ def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
         max_price=_safe_float(config.get("sms_max_price"), -1),
         fixed_price=_safe_float(config.get("sms_fixed_price"), -1),
         proxy=(str(config.get("sms_proxy") or config.get("proxy") or "")).strip() or None,
-        reuse_phone_to_max=_safe_bool(config.get("sms_reuse_phone"), False),
-        phone_success_max=max(0, _safe_int(config.get("sms_phone_success_max"), 3)),
     )
 
 
@@ -955,11 +989,6 @@ class PhoneCallbackController:
     def get_phone(self) -> str:
         """阶段 1：租手机号（返回带 + 的 E.164）。"""
         provider = self._ensure_provider()
-        # 同号复用锁，防止两个注册任务并发抢同一份缓存
-        if isinstance(provider, SmsActivateProvider) and not self._verify_lock_acquired:
-            _SMS_VERIFY_LOCK.acquire()
-            self._verify_lock_acquired = True
-
         candidates = self._resolve_country_candidates(provider)
         preview = ",".join(
             f"{c}({SMS_COUNTRY_NAMES_CN.get(c, '?')})" for c in candidates[:5]
@@ -979,10 +1008,9 @@ class PhoneCallbackController:
             self._release_lock()
             raise
 
-        reused = bool((self.activation.metadata or {}).get("reused"))
         used_country = self.activation.country or candidates[0]
         self.log(
-            f"已租到号码{'（复用）' if reused else ''}: {self.activation.phone_number} "
+            f"已租到号码: {self.activation.phone_number} "
             f"国家={country_label(used_country)} "
             f"(activation_id={self.activation.activation_id})"
         )
@@ -1062,6 +1090,12 @@ class PhoneCallbackController:
             self.log(f"号码已标记完成: activation_id={self.activation.activation_id}")
         self._release_lock()
 
+    def mark_otp_submitted(self) -> None:
+        if self.activation and self.provider:
+            setter = getattr(self.provider, "_set_activation_state", None)
+            if callable(setter):
+                setter(self.activation.activation_id, "otp_submitted")
+
     def mark_code_failed(self, reason: str = "") -> None:
         if self.activation and self.provider:
             try:
@@ -1085,16 +1119,16 @@ class PhoneCallbackController:
             except Exception:
                 logger.warning("取消不可用号码 activation 失败: %s", activation_id, exc_info=True)
             finally:
-                # 无论平台请求是否抛异常，本次号码都不能再被复用；后续 cleanup
+                # 无论平台请求是否抛异常，本次 activation 都不能再次使用；后续 cleanup
                 # 也不再对同一个 activation 发送第二次 cancel。
                 self.activation = None
                 self._release_lock()
 
-    def stop_reuse(self, reason: str = "") -> None:
+    def complete_activation(self, reason: str = "") -> None:
         """号码已经被 OpenAI 接受：结束结算并阻止 finally 再执行 cancel。"""
         if self.activation and self.provider:
             try:
-                self.provider.stop_reuse(self.activation.activation_id, reason=reason)
+                self.provider.complete_activation(self.activation.activation_id, reason=reason)
             except Exception:
                 logger.warning("结束已使用号码 activation 失败", exc_info=True)
             self.completed = True
@@ -1112,12 +1146,8 @@ class PhoneCallbackController:
         self._release_lock()
 
     def _release_lock(self) -> None:
-        if self._verify_lock_acquired:
-            try:
-                _SMS_VERIFY_LOCK.release()
-            except RuntimeError:
-                pass
-            self._verify_lock_acquired = False
+        # 高并发模式不再持有全局手机验证锁；保留方法兼容既有调用点。
+        self._verify_lock_acquired = False
 
 
 def resolve_sms_settings(extra_config: Optional[dict] = None) -> dict:

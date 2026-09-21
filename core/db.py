@@ -4,6 +4,7 @@ import os
 import secrets
 from typing import Optional
 from sqlmodel import Field, SQLModel, create_engine, Session, select
+from sqlalchemy import event
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 import json
@@ -41,7 +42,7 @@ def _read_positive_int_env(name: str, default: int) -> int:
 
 # PostgreSQL 是多连接服务，连接断开（数据库重启、网络抖动）后应自动探活重连。
 # 200 个网络 worker 不需要 200 个数据库连接：写入时间远小于外部 HTTP 等待时间。
-# SQLite 不传连接池参数，保留其单机文件数据库的默认行为。
+# SQLite 使用 WAL 允许读写并行，busy timeout 让短暂的写锁竞争自动等待。
 _engine_options = (
     {
         "pool_pre_ping": True,
@@ -50,9 +51,23 @@ _engine_options = (
         "pool_timeout": _read_positive_int_env("DB_POOL_TIMEOUT", 30),
     }
     if _database_backend == "postgresql"
-    else {"connect_args": {"check_same_thread": False}}
+    else {"connect_args": {"check_same_thread": False, "timeout": 30}}
 )
 engine = create_engine(DATABASE_URL, **_engine_options)
+
+
+if _database_backend == "sqlite":
+    @event.listens_for(engine, "connect")
+    def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
+        """Reduce lock errors for the supported 40-worker SQLite mode."""
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
 
 
 class AccountModel(SQLModel, table=True):

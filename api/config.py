@@ -107,8 +107,6 @@ CONFIG_KEYS = [
     "sms_api_key",
     "sms_service",
     "sms_max_price",
-    "sms_reuse_phone",
-    "sms_phone_success_max",
     "sms_per_phone_timeout",
     "sms_max_phone_attempts",
     "sms_code_retries_per_phone",

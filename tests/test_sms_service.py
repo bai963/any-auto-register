@@ -1,7 +1,4 @@
-import json
-import tempfile
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from services import sms_service
@@ -32,21 +29,6 @@ class _Resp:
     def raise_for_status(self):
         return None
 
-
-class _IsolatedCacheMixin:
-    """接码号码复用缓存是模块级全局 + 磁盘文件，测试之间必须隔离。"""
-
-    def setUp(self):
-        super().setUp()
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        cache_path = Path(self._tmp.name) / "cache.json"
-        patcher = mock.patch.object(sms_service, "_cache_file", lambda: cache_path)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        sms_service._SMS_CACHE = None
-        self.addCleanup(setattr, sms_service, "_SMS_CACHE", None)
-        self.cache_path = cache_path
 
 
 class SmsHelperTests(unittest.TestCase):
@@ -159,7 +141,7 @@ class TopCountryTests(unittest.TestCase):
             self.assertIsNone(self.provider.get_best_country())
 
 
-class ProviderRequestTests(_IsolatedCacheMixin, unittest.TestCase):
+class ProviderRequestTests(unittest.TestCase):
     def test_balance_parsing(self):
         provider = SmsActivateProvider(api_key="k")
         with mock.patch.object(provider, "_request", return_value=_Resp("ACCESS_BALANCE:12.5")):
@@ -199,7 +181,7 @@ class ProviderRequestTests(_IsolatedCacheMixin, unittest.TestCase):
         self.assertEqual(info["phoneNumber"], "66123456789")
 
     def test_get_number_walks_candidate_countries(self):
-        provider = SmsActivateProvider(api_key="k", reuse_phone_to_max=False)
+        provider = SmsActivateProvider(api_key="k")
         calls = []
 
         def fake_request(action, service, country):
@@ -213,13 +195,12 @@ class ProviderRequestTests(_IsolatedCacheMixin, unittest.TestCase):
 
         self.assertEqual(activation.phone_number, "+66123")
         self.assertEqual(activation.country, "52")
-        self.assertFalse(activation.metadata["reused"])
         # 每个国家先试 V2 再退 V1
         self.assertEqual(calls[:2], [("getNumberV2", "16"), ("getNumber", "16")])
 
     def test_no_numbers_points_at_the_bid_being_below_market(self):
         """NO_NUMBERS 大多不是没货，是出价压得太低。"""
-        provider = SmsActivateProvider(api_key="k", reuse_phone_to_max=False, fixed_price=0.054)
+        provider = SmsActivateProvider(api_key="k", fixed_price=0.054)
 
         with (
             mock.patch.object(provider, "_request_number", side_effect=RuntimeError("NO_NUMBERS")),
@@ -237,7 +218,7 @@ class ProviderRequestTests(_IsolatedCacheMixin, unittest.TestCase):
         self.assertIn("0.054", joined)
 
     def test_bid_at_market_price_is_not_nagged_about(self):
-        provider = SmsActivateProvider(api_key="k", reuse_phone_to_max=False, max_price=0.6)
+        provider = SmsActivateProvider(api_key="k", max_price=0.6)
 
         with (
             mock.patch.object(provider, "_request_number", side_effect=RuntimeError("NO_NUMBERS")),
@@ -254,7 +235,7 @@ class ProviderRequestTests(_IsolatedCacheMixin, unittest.TestCase):
         )
 
     def test_get_number_reports_every_candidate_failure(self):
-        provider = SmsActivateProvider(api_key="k", reuse_phone_to_max=False)
+        provider = SmsActivateProvider(api_key="k")
         with mock.patch.object(provider, "_request_number", side_effect=RuntimeError("NO_BALANCE")):
             with self.assertRaises(RuntimeError) as ctx:
                 provider.get_number(service="dr", country_candidates=["16", "52"])
@@ -262,58 +243,6 @@ class ProviderRequestTests(_IsolatedCacheMixin, unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("16:", message)
         self.assertIn("52:", message)
-
-    def test_number_is_reused_until_success_cap(self):
-        provider = SmsActivateProvider(api_key="k", reuse_phone_to_max=True, phone_success_max=2)
-        info = {"activationId": "9001", "phoneNumber": "66123", "countryPhoneCode": "66"}
-
-        with mock.patch.object(provider, "_request_number", return_value=info) as rent:
-            first = provider.get_number(service="dr", country_candidates=["52"])
-            second = provider.get_number(service="dr", country_candidates=["52"])
-
-        self.assertEqual(rent.call_count, 1)
-        self.assertFalse(first.metadata["reused"])
-        self.assertTrue(second.metadata["reused"])
-        self.assertTrue(self.cache_path.exists())
-
-    def test_reuse_stops_after_success_cap(self):
-        provider = SmsActivateProvider(api_key="k", reuse_phone_to_max=True, phone_success_max=1)
-        info = {"activationId": "9001", "phoneNumber": "66123", "countryPhoneCode": "66"}
-
-        with mock.patch.object(provider, "_request_number", return_value=info), \
-                mock.patch.object(provider, "_request", return_value=_Resp("ACCESS_ACTIVATION")):
-            provider.get_number(service="dr", country_candidates=["52"])
-            provider.report_success("9001")
-            reuse = provider._load_cache("dr", "52")
-
-        self.assertIsNone(reuse)
-
-    def test_rejected_number_stops_reuse_and_refunds(self):
-        provider = SmsActivateProvider(api_key="k", reuse_phone_to_max=True)
-        info = {"activationId": "9001", "phoneNumber": "66123", "countryPhoneCode": "66"}
-
-        with mock.patch.object(provider, "_request_number", return_value=info), \
-                mock.patch.object(provider, "_request", return_value=_Resp("ACCESS_CANCEL")) as req:
-            provider.get_number(service="dr", country_candidates=["52"])
-            provider.mark_send_failed("9001", reason="phone_number_already_in_use")
-
-        self.assertEqual(req.call_args.args[0]["status"], 8)
-        self.assertIsNone(sms_service._SMS_CACHE)
-
-    def test_stop_reuse_drops_the_cached_number_without_refunding(self):
-        """号已经注册出账号了：不能再复用，但它是好号，不该去要退款。"""
-        provider = SmsActivateProvider(api_key="k", reuse_phone_to_max=True)
-        info = {"activationId": "9001", "phoneNumber": "66123", "countryPhoneCode": "66"}
-
-        with mock.patch.object(provider, "_request_number", return_value=info), \
-                mock.patch.object(provider, "_request", return_value=_Resp("ACCESS_READY")) as req:
-            provider.get_number(service="dr", country_candidates=["52"])
-            provider.stop_reuse("9001", reason="已注册出账号")
-
-        self.assertIsNone(sms_service._SMS_CACHE)
-        self.assertFalse(
-            [call for call in req.call_args_list if call.args[0].get("status") == 8]
-        )
 
     def test_status_v2_extracts_code_from_channel_payload(self):
         provider = SmsActivateProvider(api_key="k")
@@ -450,7 +379,6 @@ class ProviderFactoryTests(unittest.TestCase):
         self.assertIn("hero-sms.com", provider.base_url)
         self.assertEqual(provider.default_service, SMS_DEFAULT_SERVICE)
         self.assertEqual(provider.default_country, SMS_DEFAULT_COUNTRY)
-        self.assertFalse(provider.reuse_phone_to_max)
 
     def test_config_values_are_applied(self):
         provider = create_sms_provider(
@@ -460,16 +388,12 @@ class ProviderFactoryTests(unittest.TestCase):
                 "sms_service": "go",
                 "sms_country": "16",
                 "sms_max_price": "0.8",
-                "sms_reuse_phone": True,
-                "sms_phone_success_max": "5",
                 "sms_proxy": "http://proxy:1",
             },
         )
         self.assertEqual(provider.default_service, "go")
         self.assertEqual(provider.default_country, "16")
         self.assertEqual(provider.max_price, 0.8)
-        self.assertTrue(provider.reuse_phone_to_max)
-        self.assertEqual(provider.phone_success_max, 5)
         self.assertEqual(provider._proxies["https"], "http://proxy:1")
 
 
@@ -676,46 +600,6 @@ class PhoneCallbackControllerTests(unittest.TestCase):
             controller.get_phone()
 
         self.assertFalse(controller._verify_lock_acquired)
-        # 锁没泄漏，下一次租号才能继续
-        self.assertTrue(sms_service._SMS_VERIFY_LOCK.acquire(blocking=False))
-        sms_service._SMS_VERIFY_LOCK.release()
-
-
-class CachePersistenceTests(_IsolatedCacheMixin, unittest.TestCase):
-    def test_cache_file_stores_used_codes_as_sorted_list(self):
-        provider = SmsActivateProvider(api_key="k")
-        provider._save_cache(
-            {
-                **provider._cache_identity("dr", "52"),
-                "activation_id": "9001",
-                "used_codes": {"222", "111"},
-            }
-        )
-        saved = json.loads(self.cache_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["used_codes"], ["111", "222"])
-
-    def test_cache_from_another_api_key_is_ignored(self):
-        SmsActivateProvider(api_key="k1")._save_cache(
-            {
-                **SmsActivateProvider(api_key="k1")._cache_identity("dr", "52"),
-                "activation_id": "9001",
-                "acquired_at": 1e12,
-            }
-        )
-        sms_service._SMS_CACHE = None
-        self.assertIsNone(SmsActivateProvider(api_key="k2")._load_cache("dr", "52"))
-
-    def test_expired_cache_is_dropped(self):
-        provider = SmsActivateProvider(api_key="k")
-        provider._save_cache(
-            {
-                **provider._cache_identity("dr", "52"),
-                "activation_id": "9001",
-                "acquired_at": 0,
-            }
-        )
-        self.assertIsNone(provider._load_cache("dr", "52"))
-        self.assertFalse(self.cache_path.exists())
 
 
 if __name__ == "__main__":

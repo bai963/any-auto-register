@@ -87,7 +87,7 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   ],
 }
 
-const SMS_BOOLEAN_KEYS = ['sms_enabled', 'sms_reuse_phone'] as const
+const SMS_BOOLEAN_KEYS = ['sms_enabled'] as const
 
 const TAB_ITEMS = [
   {
@@ -348,8 +348,6 @@ const TAB_ITEMS = [
         desc: '单号窗口内只轮询接码平台收码，窗口用尽则换号',
         fields: [
           { key: 'sms_max_price', label: '智能选号价格上限', placeholder: '留空或 0 表示不限' },
-          { key: 'sms_reuse_phone', label: '复用同一号码', type: 'boolean' },
-          { key: 'sms_phone_success_max', label: '单号复用上限', placeholder: '3' },
           { key: 'sms_per_phone_timeout', label: '单号等待秒数', placeholder: '80' },
           { key: 'sms_max_phone_attempts', label: '最多换号次数', placeholder: '3' },
           { key: 'sms_code_retries_per_phone', label: '单号内验证重试次数', placeholder: '2' },

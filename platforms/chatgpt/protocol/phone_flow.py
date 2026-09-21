@@ -561,7 +561,7 @@ class PhoneRegisterMixin:
                 # 这个号已经挂在那个半成品账号上了，外层再开一轮必须换新号，
                 # 否则只会一直撞 phone_number_in_use
                 try:
-                    ctrl.stop_reuse(f"号 {phone} 已注册出账号")
+                    ctrl.complete_activation(f"号 {phone} 已注册出账号")
                 except Exception:
                     pass
                 raise
@@ -803,6 +803,12 @@ class PhoneRegisterMixin:
             seen_codes.add(code)
 
             try:
+                # 请求已发出但响应超时是灰色状态：持久化为 otp_submitted，重启后
+                # 不会误把可能已验证的号码直接退款。
+                try:
+                    ctrl.mark_otp_submitted()
+                except Exception:
+                    pass
                 validate_resp = self._phone_otp_validate(
                     code,
                     referer=getattr(self, "_phone_verification_referer", "")

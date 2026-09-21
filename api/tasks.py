@@ -35,8 +35,8 @@ _task_store = RegisterTaskStore(
 
 MAX_REGISTER_RETRY_TIMES = 10
 MAX_TASK_CONCURRENCY = 200
-# SQLite 的写锁模型不适合大量并发任务；高并发必须使用 PostgreSQL。
-SQLITE_MAX_TASK_CONCURRENCY = 10
+# SQLite 使用 WAL 与 busy timeout 支撑本地中等并发；更高并发仍建议 PostgreSQL。
+SQLITE_MAX_TASK_CONCURRENCY = 40
 DEFAULT_REGISTER_RETRY_TIMES = 1
 # 「重开也是同样结局」的失败最多连着出现几轮就收手。
 #
@@ -356,7 +356,7 @@ def _get_task_snapshot(task_id: str) -> dict:
 
 
 def _validate_task_concurrency(concurrency: int) -> None:
-    """SQLite 只保留给本地小任务；200 并发模式要求 PostgreSQL。"""
+    """SQLite 支持本地中等并发；更高并发模式要求 PostgreSQL。"""
     if engine.url.get_backend_name() == "sqlite" and concurrency > SQLITE_MAX_TASK_CONCURRENCY:
         raise HTTPException(
             400,
