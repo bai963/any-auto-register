@@ -374,47 +374,68 @@ class PhoneRegisterMixin:
         except Exception:
             return {}
 
+    def _check_add_email_state(self, continue_url: str = "") -> str:
+        """无副作用地确认当前会话是否还允许提交下一个绑定邮箱。
+
+        失败邮箱绝不能直接导致继续消耗邮箱池。此探针只导航到 add-email 页面：
+        最终仍停在该页才允许下一轮；登录页、验证码页和未知响应一律停止。
+        """
+        try:
+            headers = self._navigation_headers()
+            headers["Referer"] = continue_url or "https://auth.openai.com/add-email"
+            resp = self.session.get(
+                "https://auth.openai.com/add-email", headers=headers,
+                timeout=30, allow_redirects=True,
+            )
+            self._trace_http("check_add_email_state", resp)
+        except Exception as exc:
+            logger.warning("[绑定邮箱] 检查 OpenAI 绑定状态失败，不继续领取邮箱: %s", exc)
+            return "unknown"
+
+        landed = self._landed_auth_page(resp)
+        if getattr(resp, "status_code", 0) != 200:
+            logger.warning("[绑定邮箱] 检查绑定状态 HTTP %s: %s", resp.status_code, describe_error(resp.text))
+            return "expired" if resp.status_code in (401, 403, 409) else "unknown"
+        if self._is_add_email_state(continue_url=landed):
+            return "add_email"
+        if self._is_email_verification_state(continue_url=landed):
+            # 当前邮箱仍处于 OTP 页，不能安全地替换成另一个邮箱。
+            return "verification_pending"
+        if self._is_forward_state(continue_url=landed):
+            return "progressed"
+        return "expired" if landed else "unknown"
+
     def bind_email(self, mail_provider: MailProvider, continue_url: str = "") -> str:
-        """要一个邮箱 → 发码 → 验码。返回下一步的 continue_url。"""
+        """单个邮箱只尝试一次：发码、等码、验码；绝不重发或复用。"""
         email = mail_provider.create_mailbox()
         logger.info("[绑定邮箱] 准备把 %s 绑到当前账号", email)
-
-        sent_at = time.time()
-        send_resp = self.add_email_send(email)
-        next_url = self._normalize_continue_url(
-            self._extract_continue_url_from_step(send_resp)
-        )
-        page_type = self._extract_page_type(send_resp)
-        if not self._is_email_verification_state(page_type, next_url):
-            logger.warning(
-                "[绑定邮箱] add-email/send 未进入邮箱验证页: page=%s continue=%s",
-                page_type or "(empty)",
-                (next_url or "")[:160],
-            )
-
         try:
-            otp_timeout = max(10, int(self._get_env("OTP_TIMEOUT", "180")))
-        except Exception:
-            otp_timeout = 180
-
-        code = mail_provider.wait_for_otp(email, timeout=otp_timeout, issued_after=sent_at)
-        try:
-            validate_resp = self.verify_otp(code)
-        except RuntimeError as exc:
-            if not any(status in str(exc) for status in ("401", "409")):
-                raise
-            # 错码/过期码：重新发一封再等一次，别为此丢掉整个号
-            logger.warning("[绑定邮箱] 验证码校验失败，重发一次再试: %s", exc)
+            setattr(mail_provider, "_email_bind_address", email)
             sent_at = time.time()
-            self.add_email_send(email)
+            send_resp = self.add_email_send(email)
+            next_url = self._normalize_continue_url(self._extract_continue_url_from_step(send_resp))
+            page_type = self._extract_page_type(send_resp)
+            if not self._is_email_verification_state(page_type, next_url):
+                raise RuntimeError(
+                    "add-email/send 后未进入邮箱验证状态: "
+                    f"page={page_type or '(empty)'} continue={next_url or '(empty)'}"
+                )
+            try:
+                otp_timeout = max(10, int(self._get_env("OTP_TIMEOUT", "180")))
+            except Exception:
+                otp_timeout = 180
             code = mail_provider.wait_for_otp(email, timeout=otp_timeout, issued_after=sent_at)
             validate_resp = self.verify_otp(code)
-
-        self.result.bound_email = email
-        logger.info("[绑定邮箱] %s 绑定成功", email)
-        return self._normalize_continue_url(
-            self._extract_continue_url_from_step(validate_resp)
-        ) or next_url or continue_url or ""
+            self.result.bound_email = email
+            setattr(mail_provider, "_email_bind_status", "used")
+            logger.info("[绑定邮箱] %s 绑定成功", email)
+            return self._normalize_continue_url(
+                self._extract_continue_url_from_step(validate_resp)
+            ) or next_url or continue_url or ""
+        except Exception:
+            # 引擎据此按真实结果回写邮箱池；这里不吞异常，外层决定是否换邮箱。
+            setattr(mail_provider, "_email_bind_status", "failed")
+            raise
 
     @staticmethod
     def _is_email_verification_state(page_type: str = "", continue_url: str = "") -> bool:
@@ -426,25 +447,57 @@ class PhoneRegisterMixin:
             or "contact-verification" in cu
         )
 
-    def _try_bind_email(self, mail_provider: Optional[MailProvider], continue_url: str) -> str:
-        """绑定失败不判死账号：号已经注册好了，缺个邮箱而已。"""
-        if mail_provider is None:
+    def _try_bind_email(
+        self, mail_provider: Optional[MailProvider], continue_url: str,
+        mail_provider_factory=None,
+    ) -> str:
+        """仅在 add-email 状态轮换邮箱；每次失败前都验证会话仍未过期。"""
+        if mail_provider is None or self.result.bound_email:
             return continue_url
-        if self.result.bound_email:
-            return continue_url
-        try:
-            return self.bind_email(mail_provider, continue_url=continue_url)
-        except Exception as exc:
-            self._bind_email_error = str(exc)
-            logger.warning("[绑定邮箱] 失败（账号本身已注册成功，可稍后重试绑定）: %s", exc)
+        if not self._is_add_email_state(continue_url=continue_url):
+            self._email_bind_status = "not_offered"
+            self._bind_email_error = "OpenAI 当前未处于 add-email 状态"
+            logger.info("[绑定邮箱] OpenAI 未提供 add-email 步骤，不领取邮箱")
             return continue_url
 
+        providers = getattr(self, "_email_bind_providers", [])
+        max_attempts = 3
+        try:
+            max_attempts = max(1, int(self._get_env("OPENAI_EMAIL_BIND_MAX_ATTEMPTS", "3")))
+        except Exception:
+            pass
+        provider = mail_provider
+        last_error = ""
+        for attempt in range(1, max_attempts + 1):
+            providers.append(provider)
+            self._email_bind_providers = providers
+            try:
+                result_url = self.bind_email(provider, continue_url=continue_url)
+                self._email_bind_status = "bound"
+                return result_url
+            except Exception as exc:
+                last_error = str(exc)
+                logger.warning("[绑定邮箱] 第 %d/%d 个邮箱失败: %s", attempt, max_attempts, last_error)
+            if attempt >= max_attempts or not callable(mail_provider_factory):
+                break
+            state = self._check_add_email_state(continue_url)
+            if state != "add_email":
+                self._email_bind_status = "state_expired" if state in ("expired", "unknown") else state
+                self._bind_email_error = f"绑定邮箱状态为 {state}，停止换邮箱；最后错误: {last_error}"
+                logger.warning("[绑定邮箱] 换邮箱前状态=%s，停止领取下一个邮箱", state)
+                return continue_url
+            provider = mail_provider_factory()
+
+        self._email_bind_status = "attempts_exhausted"
+        self._bind_email_error = last_error or "邮箱绑定失败"
+        return continue_url
     # ── 主流程 ──
 
     def run_phone_register(
         self,
         mail_provider: Optional[MailProvider] = None,
         bind_email: bool = False,
+        mail_provider_factory=None,
     ) -> Any:
         """用接码平台的手机号注册一个账号，可选把邮箱绑上去。"""
         if self._sms_callback is None:
@@ -452,6 +505,8 @@ class PhoneRegisterMixin:
                 "手机注册需要接码平台：请先在「设置 → 接码」里启用并填好 API Key"
             )
         self._bind_email_error = ""
+        self._email_bind_status = "not_attempted"
+        self._email_bind_providers = []
         self._phone_verification_referer = PHONE_VERIFICATION_REFERER
         binder = mail_provider if bind_email else None
 
@@ -477,16 +532,16 @@ class PhoneRegisterMixin:
 
         # 手机验完之后服务端可能直接把 add-email 摆在下一步
         if self._is_add_email_state(continue_url=continue_url):
-            continue_url = self._try_bind_email(binder, continue_url)
+            continue_url = self._try_bind_email(binder, continue_url, mail_provider_factory)
 
         if (not continue_url) or "/about-you" in continue_url:
             continue_url = self.create_account()
             if self._is_add_email_state(continue_url=continue_url):
-                continue_url = self._try_bind_email(binder, continue_url)
+                continue_url = self._try_bind_email(binder, continue_url, mail_provider_factory)
 
         # 服务端没主动要求绑邮箱时，也在跟重定向链之前试一次：这一步只在
         # authorize 流程还停在 add-email 上时才会被接受，被拒了就当没绑。
-        continue_url = self._try_bind_email(binder, continue_url)
+        continue_url = self._try_bind_email(binder, continue_url, mail_provider_factory)
 
         return self._finish_authorized_flow(continue_url, auth_url, mail_provider)
 

@@ -3754,89 +3754,59 @@ class OutlookMailbox(BaseMailbox):
         return bool(str(extra.get("mailapi_url") or "").strip())
 
     def _pop_account(self) -> dict:
+        """原子领取一个 Outlook 池邮箱，跨 spawn 子进程也绝不重复。
+
+        PostgreSQL 用 ``FOR UPDATE SKIP LOCKED``，并发 worker 不会互相等待；
+        SQLite 用 ``BEGIN IMMEDIATE`` 抢到唯一写锁后再挑选和置为 in_use。两种
+        情况均在同一短事务内完成状态转换，不能只依赖进程内 threading.Lock。
+        """
         from sqlalchemy import func, or_
         from sqlmodel import Session, select
         from core.db import engine, AccountModel, OutlookAccountModel, _utcnow
 
         wanted_type = self._pool_account_type
+        backend = engine.url.get_backend_name()
         if wanted_type:
             self._log(
                 "[微软邮箱] 号池筛选: "
                 f"mail_import_source={self._mail_import_source or '(未设置)'} "
-                f"只取 account_type={wanted_type}"
-                f"（{self._describe_pool_account_type(wanted_type)}）"
+                f"只取 account_type={wanted_type}（{self._describe_pool_account_type(wanted_type)}）"
             )
         else:
             self._log("[微软邮箱] 号池筛选: 未指定导入类型，整池取号")
 
-        with OutlookMailbox._pop_lock:
-            with Session(engine) as session:
-                # 导入记录永久保留，取号只筛 available 并标记 in_use；同时按
-                # accounts 表兜一道，注册过的地址不再拿来创建新账号。
+        # SQLite 的 IMMEDIATE 会等待 busy_timeout；PG 的 SKIP LOCKED 则直接跳过竞争行。
+        with Session(engine) as session:
+            if backend == "sqlite":
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            try:
                 registered = select(func.lower(AccountModel.email))
                 query = (
                     select(OutlookAccountModel)
                     .where(OutlookAccountModel.enabled == True)
-                    .where(
-                        or_(
-                            OutlookAccountModel.status == "available",
-                            OutlookAccountModel.status == None,
-                            OutlookAccountModel.status == "",
-                        )
-                    )
+                    .where(or_(
+                        OutlookAccountModel.status == "available",
+                        OutlookAccountModel.status == None,
+                        OutlookAccountModel.status == "",
+                    ))
                     .where(func.lower(OutlookAccountModel.email).notin_(registered))
                     .order_by(OutlookAccountModel.id)
+                    .limit(1)
                 )
                 if wanted_type:
-                    query = query.where(
-                        self._account_type_matches(
-                            OutlookAccountModel.account_type, wanted_type
-                        )
-                    )
+                    query = query.where(self._account_type_matches(
+                        OutlookAccountModel.account_type, wanted_type
+                    ))
+                if backend == "postgresql":
+                    query = query.with_for_update(skip_locked=True)
                 account = session.exec(query).first()
                 if not account:
-                    available_left = select(func.count(OutlookAccountModel.id)).where(
-                        OutlookAccountModel.enabled == True,
-                        or_(
-                            OutlookAccountModel.status == "available",
-                            OutlookAccountModel.status == None,
-                            OutlookAccountModel.status == "",
-                        ),
-                    )
-                    total_left = session.exec(available_left).one()
-                    if wanted_type:
-                        same_type_left = session.exec(
-                            available_left.where(
-                                self._account_type_matches(
-                                    OutlookAccountModel.account_type, wanted_type
-                                )
-                            )
-                        ).one()
-                        label = self._describe_pool_account_type(wanted_type)
-                        if same_type_left:
-                            raise RuntimeError(
-                                f"微软邮箱账号池里剩下的 {same_type_left} 个 {label} 地址"
-                                "都已经注册过了，请导入新的邮箱"
-                            )
-                        raise RuntimeError(
-                            f"邮箱导入类型选的是 {label}，但微软邮箱账号池里没有"
-                            f" account_type={wanted_type} 的账号"
-                            f"（池里还剩 {total_left} 个其它类型的账号，不会拿来顶替），"
-                            "请按该类型导入邮箱，或到设置页改回对应的导入类型"
-                        )
-                    if total_left:
-                        raise RuntimeError(
-                            f"微软邮箱账号池里剩下的 {total_left} 个地址都已经注册过了，"
-                            "请导入新的邮箱"
-                        )
-                    raise RuntimeError("微软邮箱账号池为空，请先在设置页批量导入")
+                    session.rollback()
+                    raise RuntimeError("微软邮箱账号池没有可领取的 available 邮箱，请导入新的邮箱")
 
                 payload = {
-                    "id": account.id,
-                    "email": account.email,
-                    "password": account.password,
-                    "client_id": account.client_id,
-                    "refresh_token": account.refresh_token,
+                    "id": account.id, "email": account.email, "password": account.password,
+                    "client_id": account.client_id, "refresh_token": account.refresh_token,
                     "account_type": getattr(account, "account_type", "microsoft_oauth"),
                     "mailapi_url": getattr(account, "mailapi_url", ""),
                 }
@@ -3846,6 +3816,9 @@ class OutlookMailbox(BaseMailbox):
                 session.add(account)
                 session.commit()
                 return payload
+            except Exception:
+                session.rollback()
+                raise
 
     def get_email(self) -> MailboxAccount:
         payload = self._pop_account()
@@ -4637,3 +4610,44 @@ class FreemailMailbox(BaseMailbox):
             poll_interval=3,
             poll_once=poll_once,
         )
+
+
+_mailbox_status_write_lock = threading.Lock()
+
+
+def apply_mailbox_status_events(events) -> None:
+    """在任务父进程提交邮箱状态事件。
+
+    spawn 注册子进程只返回事件，避免 SQLite 多进程同时写状态表。SQLite 在此
+    使用单写者锁；PostgreSQL 保持并行事务能力。无效或非 Outlook 事件忽略。
+    """
+    rows = [row for row in (events or []) if isinstance(row, dict) and row.get("status")]
+    if not rows:
+        return
+    from sqlmodel import Session, select
+    from core.db import engine, OutlookAccountModel, _utcnow
+
+    lock = _mailbox_status_write_lock if engine.url.get_backend_name() == "sqlite" else None
+    if lock:
+        lock.acquire()
+    try:
+        with Session(engine) as session:
+            for item in rows:
+                status = str(item.get("status") or "").strip().lower()
+                if status not in {"available", "in_use", "used", "failed"}:
+                    continue
+                email = str(item.get("email") or "").strip()
+                account_id = str(item.get("account_id") or "").strip()
+                record = session.get(OutlookAccountModel, int(account_id)) if account_id.isdigit() else None
+                if record is None and email:
+                    record = session.exec(select(OutlookAccountModel).where(
+                        OutlookAccountModel.email == email
+                    )).first()
+                if record is not None:
+                    record.status = status
+                    record.updated_at = _utcnow()
+                    session.add(record)
+            session.commit()
+    finally:
+        if lock:
+            lock.release()

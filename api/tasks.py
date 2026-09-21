@@ -61,7 +61,10 @@ def _register_platform_child(payload: dict, result_queue) -> None:
     try:
         from core.base_mailbox import create_mailbox
         from core.base_platform import RegisterConfig
-        from core.registry import get
+        # spawn 子进程不会继承主进程 lifespan 中的插件注册表，必须自行加载。
+        from core.registry import get, load_all
+
+        load_all()
 
         config = RegisterConfig(
             executor_type=payload["executor_type"],
@@ -823,6 +826,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 "luckmail_base_url",
                                 merged_extra.get("luckmail_base_url"),
                             )
+                # 邮箱状态由注册子进程随结果返回；父进程统一提交，SQLite 下避免
+                # 多进程同时写邮箱池导致锁竞争，PostgreSQL 则正常批量事务提交。
+                if isinstance(account.extra, dict):
+                    from core.base_mailbox import apply_mailbox_status_events
+                    apply_mailbox_status_events(account.extra.pop("mailbox_status_events", []))
                 saved_account = save_account(account)
                 if _proxy:
                     _proxy_pool.report_success(_proxy)

@@ -201,28 +201,34 @@ class BindEmailTests(unittest.TestCase):
         self.assertEqual(flow.session.calls[1]["json"], {"code": "123456"})
         self.assertEqual(next_url, "https://auth.openai.com/authorize/continue?x=1")
 
-    def test_bind_email_resends_once_when_code_is_rejected(self):
+    def test_bind_email_does_not_resend_after_code_is_rejected(self):
         flow = _flow([
-            _FakeResponse(payload={}),
+            _FakeResponse(payload={"page": {"type": "email_otp_verification"}}),
             _FakeResponse(status_code=401, text="invalid code"),
-            _FakeResponse(payload={}),
-            _FakeResponse(payload={"continue_url": "https://auth.openai.com/next"}),
         ])
         flow._normalize_continue_url = lambda url: url
         provider = _FakeMailProvider()
 
-        flow.bind_email(provider)
+        with self.assertRaises(RuntimeError):
+            flow.bind_email(provider)
 
         self.assertEqual(
             [call["url"].rsplit("/", 2)[-2:] for call in flow.session.calls],
-            [
-                ["add-email", "send"],
-                ["email-otp", "validate"],
-                ["add-email", "send"],
-                ["email-otp", "validate"],
-            ],
+            [["add-email", "send"], ["email-otp", "validate"]],
         )
-        self.assertEqual(flow.result.bound_email, "pool@example.com")
+        self.assertEqual(getattr(provider, "_email_bind_status", ""), "failed")
+        self.assertFalse(flow.result.bound_email)
+
+    def test_not_in_add_email_state_does_not_claim_a_mailbox(self):
+        flow = _flow()
+        flow._is_add_email_state = lambda **_kwargs: False
+        provider = _FakeMailProvider()
+
+        result = flow._try_bind_email(provider, "https://auth.openai.com/about-you")
+
+        self.assertEqual(result, "https://auth.openai.com/about-you")
+        self.assertEqual(provider.created, 0)
+        self.assertEqual(flow._email_bind_status, "not_offered")
 
     def test_bind_failure_keeps_the_account(self):
         flow = _flow([_FakeResponse(status_code=400, payload={"error": {"message": "invalid state"}})])
@@ -932,7 +938,7 @@ class RegistrationEngineFlowDispatchTests(unittest.TestCase):
         with mock.patch.object(ChatGPTRegistrationEngine, "_build_flow", return_value=flow):
             result = engine.run()
 
-        flow.run_phone_register.assert_called_once_with(mail_provider=None, bind_email=False)
+        flow.run_phone_register.assert_called_once_with(mail_provider=None, bind_email=False, mail_provider_factory=None)
         self.assertTrue(result.success)
         self.assertEqual(result.email, "+56971901026")
         self.assertEqual(result.metadata["phone_number"], "+56971901026")

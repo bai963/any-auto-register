@@ -163,23 +163,37 @@ class ChatGPTRegistrationEngine:
         # 只有"开始/失败"两行，出事了连服务端回的是哪个 page 都看不见。
         try:
             with mirror_protocol_logs(self.log):
-                result = flow.run_phone_register(mail_provider=provider, bind_email=bind_email)
+                result = flow.run_phone_register(
+                    mail_provider=provider, bind_email=bind_email,
+                    mail_provider_factory=self._build_mail_provider if bind_email else None,
+                )
         except Exception as exc:
             registration = self._salvage(flow, exc)
-            self._set_mailbox_status(provider, "used" if registration.success else "failed")
+            self._record_phone_bind_mailbox_statuses(flow, provider, registration)
             return self._attach_mailbox_credentials(registration, provider)
 
+        provider = self._bound_mail_provider(flow, provider)
         self._ensure_two_factor(flow, provider)
         registration = self._attach_two_factor(
             RegistrationResult.from_auth_result(result, source="phone_register")
         )
-        self._set_mailbox_status(provider, "used")
+        self._record_phone_bind_mailbox_statuses(flow, provider, registration)
         registration = self._attach_mailbox_credentials(registration, provider)
+        registration.metadata["email_bind_status"] = getattr(flow, "_email_bind_status", "not_attempted")
+        registration.metadata["email_bind_attempts"] = len(getattr(flow, "_email_bind_providers", []) or [])
         bind_error = getattr(flow, "_bind_email_error", "")
         if bind_email and not registration.metadata.get("bound_email"):
             registration.metadata["bind_email_error"] = bind_error or "未绑定邮箱"
             self.log(f"手机号注册成功但邮箱未绑上：{bind_error or '服务端未提供 add-email 步骤'}")
         return registration
+
+    @staticmethod
+    def _bound_mail_provider(flow: AuthFlow, fallback: Optional[MailboxProviderAdapter]):
+        """返回实际绑成功的邮箱 provider，供凭据保存和后续 2FA 使用。"""
+        for provider in reversed(getattr(flow, "_email_bind_providers", []) or []):
+            if getattr(provider, "_email_bind_status", "") == "used":
+                return provider
+        return fallback
 
     def _build_mail_provider(self) -> MailboxProviderAdapter:
         return MailboxProviderAdapter(
@@ -226,6 +240,33 @@ class ChatGPTRegistrationEngine:
             if provider_name:
                 registration.metadata["mail_provider"] = provider_name
         return registration
+
+    def _record_phone_bind_mailbox_statuses(
+        self, flow: AuthFlow, initial_provider: Optional[MailboxProviderAdapter], registration: RegistrationResult
+    ) -> None:
+        """邮箱池只按实际绑定结果结算；未领取的邮箱不写状态。"""
+        providers = list(getattr(flow, "_email_bind_providers", []) or [])
+        if not providers and initial_provider is not None:
+            # 非绑定流程或协议层在领取前失败时，保持旧的失败回写语义。
+            if self.register_flow != REGISTER_FLOW_PHONE_WITH_EMAIL:
+                return
+            if getattr(initial_provider, "account", None) is not None:
+                providers = [initial_provider]
+        events = []
+        for provider in providers:
+            account = getattr(provider, "account", None)
+            if account is None:
+                continue
+            status = getattr(provider, "_email_bind_status", "")
+            events.append({
+                "email": str(getattr(account, "email", "") or ""),
+                "account_id": str(getattr(account, "account_id", "") or ""),
+                "status": "used" if status == "used" else "failed",
+            })
+        if events:
+            # 注册在 spawn 子进程中执行；不能由子进程并发回写 SQLite。
+            # 事件随 Account 返回父进程，由任务层的单写者统一提交。
+            registration.metadata["mailbox_status_events"] = events
 
     @staticmethod
     def _set_mailbox_status(

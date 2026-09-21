@@ -49,8 +49,8 @@ def _read_positive_int_env(name: str, default: int) -> int:
 _engine_options = (
     {
         "pool_pre_ping": True,
-        "pool_size": _read_positive_int_env("DB_POOL_SIZE", 30),
-        "max_overflow": _read_positive_int_env("DB_MAX_OVERFLOW", 50),
+        "pool_size": _read_positive_int_env("DB_POOL_SIZE", 50),
+        "max_overflow": _read_positive_int_env("DB_MAX_OVERFLOW", 100),
         "pool_timeout": _read_positive_int_env("DB_POOL_TIMEOUT", 30),
     }
     if _database_backend == "postgresql"
@@ -68,6 +68,8 @@ if _database_backend == "sqlite":
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA busy_timeout=30000")
+            # WAL 文件过大时 checkpoint 会拖慢所有写者；该阈值适合本地 40 worker。
+            cursor.execute("PRAGMA wal_autocheckpoint=1000")
             cursor.execute("PRAGMA foreign_keys=ON")
         finally:
             cursor.close()

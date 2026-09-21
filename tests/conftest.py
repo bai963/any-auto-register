@@ -10,11 +10,16 @@
 ``core.config_store`` 里，不 import 它就不会进 ``SQLModel.metadata``。
 """
 
+import atexit
 import os
+import shutil
 import tempfile
 
-_TMP_DB_DIR = tempfile.TemporaryDirectory()
-os.environ["DATABASE_URL"] = f"sqlite:///{os.path.join(_TMP_DB_DIR.name, 'test.db')}"
+# pytest 会在解析参数前加载 conftest。若参数非法，pytest_sessionfinish 不会执行；
+# TemporaryDirectory 的 weakref 清理会在仍持有 SQLite 连接时抛 WinError 32。
+# 这里显式 dispose 并 best-effort 清理，测试临时目录删不掉也不让解释器退出时报错。
+_TMP_DB_DIR = tempfile.mkdtemp(prefix="any-auto-register-pytest-")
+os.environ["DATABASE_URL"] = f"sqlite:///{os.path.join(_TMP_DB_DIR, 'test.db')}"
 
 import core.config_store  # noqa: E402,F401  注册 configs 表
 from core.db import init_db  # noqa: E402  必须在 DATABASE_URL 设好之后再 import
@@ -22,11 +27,21 @@ from core.db import init_db  # noqa: E402  必须在 DATABASE_URL 设好之后�
 init_db()
 
 
-def pytest_sessionfinish(session, exitstatus):
-    from core.db import engine
-
-    engine.dispose()
+def _cleanup_test_database() -> None:
+    # dispose 必须发生在删文件之前；Windows 不允许删除仍被 SQLite 打开的文件。
     try:
-        _TMP_DB_DIR.cleanup()
-    except PermissionError:
+        from core.db import engine
+        engine.dispose()
+    except Exception:
         pass
+    try:
+        shutil.rmtree(_TMP_DB_DIR, ignore_errors=True)
+    except Exception:
+        pass
+
+
+atexit.register(_cleanup_test_database)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _cleanup_test_database()
