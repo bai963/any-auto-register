@@ -32,11 +32,26 @@ if _database_backend not in {"sqlite", "postgresql"}:
         f"不支持的数据库类型: {_database_backend}。当前仅支持 SQLite 和 PostgreSQL。"
     )
 
+def _read_positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
 # PostgreSQL 是多连接服务，连接断开（数据库重启、网络抖动）后应自动探活重连。
+# 200 个网络 worker 不需要 200 个数据库连接：写入时间远小于外部 HTTP 等待时间。
 # SQLite 不传连接池参数，保留其单机文件数据库的默认行为。
-_engine_options = {"pool_pre_ping": True} if _database_backend == "postgresql" else {
-    "connect_args": {"check_same_thread": False},
-}
+_engine_options = (
+    {
+        "pool_pre_ping": True,
+        "pool_size": _read_positive_int_env("DB_POOL_SIZE", 30),
+        "max_overflow": _read_positive_int_env("DB_MAX_OVERFLOW", 50),
+        "pool_timeout": _read_positive_int_env("DB_POOL_TIMEOUT", 30),
+    }
+    if _database_backend == "postgresql"
+    else {"connect_args": {"check_same_thread": False}}
+)
 engine = create_engine(DATABASE_URL, **_engine_options)
 
 

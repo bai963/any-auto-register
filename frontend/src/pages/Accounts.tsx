@@ -1642,8 +1642,14 @@ export default function Accounts() {
             <Form.Item name="count" label="注册数量" initialValue={1} rules={[{ required: true }]}>
               <Input type="number" min={1} />
             </Form.Item>
-            <Form.Item name="concurrency" label="并发数" initialValue={1} rules={[{ required: true }]}>
-              <Input type="number" min={1} />
+            <Form.Item
+              name="concurrency"
+              label="并发数"
+              initialValue={1}
+              rules={[{ required: true }]}
+              extra="最高 200；超过 10 并发需配置 PostgreSQL。高并发建议使用独立代理，并注意邮箱与 OpenAI 的限流/风控。"
+            >
+              <InputNumber min={1} max={200} precision={0} style={{ width: '100%' }} />
             </Form.Item>
             <Form.Item name="register_delay_seconds" label="每个注册延迟(秒)" initialValue={0}>
               <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 不延迟" />
@@ -1729,8 +1735,13 @@ export default function Accounts() {
               >
                 <Switch />
               </Form.Item>
-              <Form.Item name="concurrency" label="并发数" initialValue={1}>
-                <InputNumber min={1} max={10} style={{ width: '100%' }} />
+              <Form.Item
+                name="concurrency"
+                label="并发数"
+                initialValue={1}
+                extra="最高 200；超过 10 并发需配置 PostgreSQL。高并发会增加 OpenAI 风控风险，建议设置间隔为 0 前确认代理资源充足。"
+              >
+                <InputNumber min={1} max={200} precision={0} style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item
                 name="delay_seconds"

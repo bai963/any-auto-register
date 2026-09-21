@@ -12,6 +12,16 @@ DATABASE_URL=postgresql+psycopg://any_auto_register:请替换强密码@127.0.0.1
 
 如果用户名或密码包含 `@`、`:`、`/`、`?` 等保留字符，请先做 URL 编码。服务启动时会自动建表；项目当前不依赖 SQLite 专用 SQL，因此同一套 API 可直接切换数据库。
 
+## 200 并发任务配置
+
+注册、补 RT 和绑 2FA 的单任务上限为 200；同一应用进程内所有这类任务共享 `TASK_GLOBAL_MAX_CONCURRENCY`（默认 200）的总预算。SQLite 最多允许 10 并发，高于此值必须使用 PostgreSQL。
+
+PostgreSQL 默认连接池为 `DB_POOL_SIZE=30`、`DB_MAX_OVERFLOW=50`、`DB_POOL_TIMEOUT=30`。网络任务绝大部分时间都在等待外部服务，不需要把数据库连接数设为 200。
+
+高并发任务会对代理实施进程内租约：默认 `PROXY_MAX_CONCURRENT_PER_IP=1`，同一个代理不会同时分配给多个账号。代理数量少于目标并发时任务会在日志中提示并等待空闲代理；未配置代理时会提示直连高并发风险。
+
+外部服务也有独立的进程内并发预算：`OPENAI_MAX_CONCURRENCY=200`、`MAIL_API_MAX_CONCURRENCY=100`、`SMS_API_MAX_CONCURRENCY=100`。限制覆盖一个账号完整的外部链路，避免 200 个 worker 同时轮询同一个邮箱/接码服务或冲击 OpenAI。任务日志会输出实际生效的预算。
+
 ## Docker Compose（随应用启动 PostgreSQL）
 
 仓库提供 `docker-compose.postgres.yml` 覆盖文件，会启动 PostgreSQL 18 并让应用等待数据库健康后再启动。项目根目录创建 `.env`：

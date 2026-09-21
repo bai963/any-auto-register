@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import os
 import threading
 import time
 from typing import Any
@@ -69,6 +70,53 @@ class AttemptResult:
     @classmethod
     def stopped(cls, message: str) -> "AttemptResult":
         return cls(AttemptOutcome.STOPPED, message)
+
+
+def _read_global_concurrency_limit() -> int:
+    """读取全局高 I/O 任务预算，避免多个任务叠加压垮外部服务。"""
+    try:
+        return max(1, min(int(os.getenv("TASK_GLOBAL_MAX_CONCURRENCY", "200")), 200))
+    except ValueError:
+        return 200
+
+
+class TaskConcurrencyLimiter:
+    """跨注册、补 RT 等任务共享的并发令牌池。
+
+    acquire 使用短超时轮询，因此停止任务后，尚未取得令牌的 worker 不会一直阻塞。
+    """
+
+    def __init__(self, limit: int | None = None):
+        self.limit = limit or _read_global_concurrency_limit()
+        self._semaphore = threading.BoundedSemaphore(self.limit)
+
+    def acquire(self, is_stop_requested) -> bool:
+        while not is_stop_requested():
+            if self._semaphore.acquire(timeout=0.25):
+                return True
+        return False
+
+    def release(self) -> None:
+        self._semaphore.release()
+
+
+class ExternalServiceLimiter(TaskConcurrencyLimiter):
+    """外部服务的共享并发预算（邮箱、接码、OpenAI）。"""
+
+
+def _read_external_limit(name: str, default: int) -> int:
+    try:
+        # 外部服务配额可小于总任务并发，但不允许超过单进程的 200 worker 上限。
+        return max(1, min(int(os.getenv(name, str(default))), 200))
+    except ValueError:
+        return default
+
+
+# 这些限制覆盖完整的外部链路，而不只是单个 HTTP 请求，防止轮询/重试时瞬间放大流量。
+global_task_concurrency_limiter = TaskConcurrencyLimiter()
+global_openai_limiter = ExternalServiceLimiter(_read_external_limit("OPENAI_MAX_CONCURRENCY", 200))
+global_mail_limiter = ExternalServiceLimiter(_read_external_limit("MAIL_API_MAX_CONCURRENCY", 100))
+global_sms_limiter = ExternalServiceLimiter(_read_external_limit("SMS_API_MAX_CONCURRENCY", 100))
 
 
 class RegisterTaskControl:
@@ -376,6 +424,12 @@ class RegisterTaskStore:
 __all__ = [
     "AttemptOutcome",
     "AttemptResult",
+    "TaskConcurrencyLimiter",
+    "global_task_concurrency_limiter",
+    "ExternalServiceLimiter",
+    "global_openai_limiter",
+    "global_mail_limiter",
+    "global_sms_limiter",
     "RegisterTaskControl",
     "RegisterTaskRecord",
     "RegisterTaskStore",

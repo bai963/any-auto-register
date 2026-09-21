@@ -13,6 +13,10 @@ from core.task_runtime import (
     RegisterTaskStore,
     SkipCurrentAttemptRequested,
     StopTaskRequested,
+    global_task_concurrency_limiter,
+    global_mail_limiter,
+    global_openai_limiter,
+    global_sms_limiter,
 )
 import time, json, asyncio, threading, logging
 
@@ -30,6 +34,9 @@ _task_store = RegisterTaskStore(
 
 
 MAX_REGISTER_RETRY_TIMES = 10
+MAX_TASK_CONCURRENCY = 200
+# SQLite 的写锁模型不适合大量并发任务；高并发必须使用 PostgreSQL。
+SQLITE_MAX_TASK_CONCURRENCY = 10
 DEFAULT_REGISTER_RETRY_TIMES = 1
 # 「重开也是同样结局」的失败最多连着出现几轮就收手。
 #
@@ -53,8 +60,8 @@ class RegisterTaskRequest(BaseModel):
     platform: str
     email: Optional[str] = None
     password: Optional[str] = None
-    count: int = 1
-    concurrency: int = 1
+    count: int = Field(default=1, ge=1)
+    concurrency: int = Field(default=1, ge=1, le=MAX_TASK_CONCURRENCY)
     # 整条注册流程失败后再开几轮（每轮都是全新的邮箱/号码/会话）。
     # 0 = 不重试；一次网络抖动、一个二手号就判 FAIL 太浪费。
     register_retry_times: int = DEFAULT_REGISTER_RETRY_TIMES
@@ -83,8 +90,8 @@ class BackfillRtTaskRequest(BaseModel):
     plus_status: str = ""
     only_missing_rt: bool = True
     allow_login: bool = True
-    concurrency: int = 1
-    delay_seconds: float = 5
+    concurrency: int = Field(default=1, ge=1, le=MAX_TASK_CONCURRENCY)
+    delay_seconds: float = Field(default=5, ge=0)
     proxy: Optional[str] = None
 
 
@@ -102,8 +109,8 @@ class Bind2faTaskRequest(BaseModel):
     plus_status: str = ""
     only_missing_2fa: bool = True
     allow_login: bool = True
-    concurrency: int = 1
-    delay_seconds: float = 5
+    concurrency: int = Field(default=1, ge=1, le=MAX_TASK_CONCURRENCY)
+    delay_seconds: float = Field(default=5, ge=0)
     proxy: Optional[str] = None
 
 
@@ -241,14 +248,30 @@ def _upsert_task_run(snapshot: dict) -> None:
         s.commit()
 
 
-def _persist_task_snapshot(task_id: str) -> None:
+# 日志、进度会被高并发 worker 频繁更新；合并为最多每秒一次的快照写入，
+# 任务结束或读取详情时可用 force=True 强制落库。
+_TASK_SNAPSHOT_FLUSH_INTERVAL_SECONDS = 1.0
+_snapshot_flush_lock = threading.Lock()
+_snapshot_last_flush_at: dict[str, float] = {}
+
+
+def _persist_task_snapshot(task_id: str, *, force: bool = False) -> None:
     if not _task_store.exists(task_id):
         return
+    now = time.monotonic()
+    with _snapshot_flush_lock:
+        last_flush_at = _snapshot_last_flush_at.get(task_id, 0.0)
+        if not force and now - last_flush_at < _TASK_SNAPSHOT_FLUSH_INTERVAL_SECONDS:
+            return
+        # 先占位，避免 200 个 worker 同时穿透节流并重复写同一条 task_runs。
+        _snapshot_last_flush_at[task_id] = now
     try:
         snapshot = _task_store.snapshot(task_id)
+        _upsert_task_run(snapshot)
     except Exception:
-        return
-    _upsert_task_run(snapshot)
+        # 允许下一次调用尽快重试，不把短暂数据库故障缓存一秒。
+        with _snapshot_flush_lock:
+            _snapshot_last_flush_at.pop(task_id, None)
 
 
 def _get_persisted_task(task_id: str) -> Optional[dict]:
@@ -321,7 +344,7 @@ def _ensure_task_mutable(task_id: str) -> None:
 def _get_task_snapshot(task_id: str) -> dict:
     _ensure_task_exists(task_id)
     if _task_store.exists(task_id):
-        _persist_task_snapshot(task_id)
+        _persist_task_snapshot(task_id, force=True)
     snapshot = _get_persisted_task(task_id)
     if snapshot is None and _task_store.exists(task_id):
         snapshot = _normalize_snapshot(_task_store.snapshot(task_id))
@@ -330,10 +353,21 @@ def _get_task_snapshot(task_id: str) -> dict:
     return snapshot
 
 
+def _validate_task_concurrency(concurrency: int) -> None:
+    """SQLite 只保留给本地小任务；200 并发模式要求 PostgreSQL。"""
+    if engine.url.get_backend_name() == "sqlite" and concurrency > SQLITE_MAX_TASK_CONCURRENCY:
+        raise HTTPException(
+            400,
+            f"SQLite 模式最多允许 {SQLITE_MAX_TASK_CONCURRENCY} 并发；"
+            "需要更高并发（最高 200）请配置 PostgreSQL DATABASE_URL。",
+        )
+
+
 def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     from core.config_store import config_store
     from core.registry import is_platform_enabled
 
+    _validate_task_concurrency(req.concurrency)
     req_data = req.model_dump()
     req_data["extra"] = deepcopy(req_data.get("extra") or {})
     prepared = RegisterTaskRequest(**req_data)
@@ -473,28 +507,29 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             {k: v for k, v in req.extra.items() if v is not None and v != ""}
         )
 
-        # 批量预取代理（无固定代理时），减少每线程单独查 DB
+        # 每个 worker 领取代理租约，默认一个代理同时只服务一个任务。
+        # 代理不足会等待空闲代理，而不是让多个账号意外复用同一出口。
         from core.proxy_pool import proxy_pool as _proxy_pool
-        _prefetched_proxies: list[str] = []
-        _prefetch_lock = threading.Lock()
-        if not req.proxy and req.count > 1:
-            with Session(engine) as _s:
-                from core.db import ProxyModel
-                from sqlmodel import select as _sel
-                _active = _s.exec(
-                    _sel(ProxyModel).where(ProxyModel.is_active == True)
-                ).all()
-                _prefetched_proxies = [p.url for p in _active if p.url]
+        _log(
+            task_id,
+            f"外部服务预算: OpenAI {global_openai_limiter.limit}，邮箱 {global_mail_limiter.limit}，接码 {global_sms_limiter.limit}，任务总并发 {global_task_concurrency_limiter.limit}",
+        )
+        if req.proxy:
+            _log(task_id, "资源预检: 使用固定代理；默认同一代理同时只运行 1 个账号")
+        else:
+            available_proxies = _proxy_pool.active_count()
+            if available_proxies == 0:
+                _log(task_id, "资源预检: 未配置可用代理，将使用直连；高并发可能触发风控或限流")
+            elif available_proxies < min(req.concurrency, req.count):
+                _log(task_id, f"资源预检: 可用代理 {available_proxies} 个，低于目标并发 {min(req.concurrency, req.count)}；任务会等待代理租约")
+            else:
+                _log(task_id, f"资源预检: 可用代理 {available_proxies} 个，满足目标并发")
 
         def _get_proxy() -> Optional[str]:
-            if req.proxy:
-                return req.proxy
-            if _prefetched_proxies:
-                with _prefetch_lock:
-                    if _prefetched_proxies:
-                        import random
-                        return random.choice(_prefetched_proxies)
-            return _proxy_pool.get_next()
+            return _proxy_pool.acquire(
+                preferred_url=req.proxy,
+                is_stop_requested=control.is_stop_requested,
+            )
 
         def _build_mailbox(proxy: Optional[str]):
             return create_mailbox(
@@ -560,8 +595,23 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             _proxy = None
             current_email = req.email or ""
             attempt_id: int | None = None
+            concurrency_slot_acquired = False
+            mail_slot_acquired = False
+            openai_slot_acquired = False
+            sms_slot_acquired = False
             round_suffix = f"（第 {round_no}/{rounds} 轮）" if rounds > 1 else ""
             try:
+                control.checkpoint()
+                concurrency_slot_acquired = global_task_concurrency_limiter.acquire(
+                    control.is_stop_requested
+                )
+                # 注册会持有邮箱资源；ChatGPT 还会占用 OpenAI 授权链预算。
+                mail_slot_acquired = global_mail_limiter.acquire(control.is_stop_requested)
+                if req.platform == "chatgpt":
+                    openai_slot_acquired = global_openai_limiter.acquire(control.is_stop_requested)
+                # 手机注册的接码 API 也需要独立预算；非手机流程不占用。
+                if str(_base_extra.get("register_method", "")).lower() in {"phone", "sms"}:
+                    sms_slot_acquired = global_sms_limiter.acquire(control.is_stop_requested)
                 control.checkpoint()
                 attempt_id = control.start_attempt()
                 control.checkpoint(attempt_id=attempt_id)
@@ -689,41 +739,69 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 )
             finally:
                 control.finish_attempt(attempt_id)
+                if _proxy:
+                    _proxy_pool.release(_proxy)
+                if sms_slot_acquired:
+                    global_sms_limiter.release()
+                if openai_slot_acquired:
+                    global_openai_limiter.release()
+                if mail_slot_acquired:
+                    global_mail_limiter.release()
+                if concurrency_slot_acquired:
+                    global_task_concurrency_limiter.release()
 
-        from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+        from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 
+        # 滑动窗口最多保留 max_workers 个 Future，避免大任务一次创建数万个 Future。
         max_workers = min(req.concurrency, req.count)
         stopped = False
+        next_index = 0
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_do_one, i) for i in range(req.count)]
-            for f in as_completed(futures):
-                try:
-                    result = f.result()
-                except CancelledError:
-                    continue
-                except Exception as e:
-                    _log(task_id, f"[ERROR] 任务线程异常: {e}")
-                    errors.append(str(e))
-                    continue
-                if result.outcome == AttemptOutcome.SUCCESS:
-                    success += 1
-                elif result.outcome == AttemptOutcome.SKIPPED:
-                    skipped += 1
-                elif result.outcome == AttemptOutcome.STOPPED:
-                    stopped = True
-                else:
-                    errors.append(result.message)
-                _task_store.update_counters(
-                    task_id,
-                    success=success,
-                    registered=success + skipped + len(errors),
-                )
-                _persist_task_snapshot(task_id)
+            pending = set()
+
+            def _submit_next() -> bool:
+                nonlocal next_index
+                if next_index >= req.count or control.is_stop_requested():
+                    return False
+                pending.add(pool.submit(_do_one, next_index))
+                next_index += 1
+                return True
+
+            while len(pending) < max_workers and _submit_next():
+                pass
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    try:
+                        result = future.result()
+                    except CancelledError:
+                        continue
+                    except Exception as e:
+                        _log(task_id, f"[ERROR] 任务线程异常: {e}")
+                        errors.append(str(e))
+                    else:
+                        if result.outcome == AttemptOutcome.SUCCESS:
+                            success += 1
+                        elif result.outcome == AttemptOutcome.SKIPPED:
+                            skipped += 1
+                        elif result.outcome == AttemptOutcome.STOPPED:
+                            stopped = True
+                        else:
+                            errors.append(result.message)
+                    _task_store.update_counters(
+                        task_id,
+                        success=success,
+                        registered=success + skipped + len(errors),
+                    )
+                    _persist_task_snapshot(task_id)
+
                 if stopped or control.is_stop_requested():
                     stopped = True
-                    for pending in futures:
-                        if pending is not f:
-                            pending.cancel()
+                    for future in pending:
+                        future.cancel()
+                    continue
+                while len(pending) < max_workers and _submit_next():
+                    pass
     except Exception as e:
         _log(task_id, f"致命错误: {e}")
         _task_store.finish(
@@ -735,7 +813,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             errors=errors,
             error=str(e),
         )
-        _persist_task_snapshot(task_id)
+        _persist_task_snapshot(task_id, force=True)
         _task_store.cleanup()
         return
 
@@ -755,7 +833,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         skipped=skipped,
         errors=errors,
     )
-    _persist_task_snapshot(task_id)
+    _persist_task_snapshot(task_id, force=True)
     _task_store.cleanup()
 
 
@@ -800,6 +878,20 @@ def _run_account_batch_task(
     control = _task_store.control_for(task_id)
     _task_store.mark_running(task_id)
     _persist_task_snapshot(task_id)
+    _log(
+        task_id,
+        f"外部服务预算: OpenAI {global_openai_limiter.limit}，邮箱 {global_mail_limiter.limit}，接码 {global_sms_limiter.limit}，任务总并发 {global_task_concurrency_limiter.limit}",
+    )
+    if proxy:
+        _log(task_id, "资源预检: 使用固定代理；默认同一代理同时只运行 1 个账号")
+    else:
+        available_proxies = proxy_pool.active_count()
+        if available_proxies == 0:
+            _log(task_id, "资源预检: 未配置可用代理，将使用直连；高并发可能触发风控或限流")
+        elif available_proxies < min(concurrency, len(account_ids)):
+            _log(task_id, f"资源预检: 可用代理 {available_proxies} 个，低于目标并发 {min(concurrency, len(account_ids))}；任务会等待代理租约")
+        else:
+            _log(task_id, f"资源预检: 可用代理 {available_proxies} 个，满足目标并发")
 
     total = len(account_ids)
     success = 0
@@ -810,9 +902,12 @@ def _run_account_batch_task(
     next_start_time = time.time()
 
     def _resolve_proxy() -> Optional[str]:
-        if proxy:
-            return normalize_proxy_url(proxy)
-        return normalize_proxy_url(proxy_pool.get_next())
+        return normalize_proxy_url(
+            proxy_pool.acquire(
+                preferred_url=proxy,
+                is_stop_requested=control.is_stop_requested,
+            )
+        )
 
     def _wait_turn(attempt_id: int | None) -> None:
         nonlocal next_start_time
@@ -830,7 +925,19 @@ def _run_account_batch_task(
 
     def _do_one(index: int, account_id: int) -> AttemptResult:
         attempt_id: int | None = None
+        account_proxy: Optional[str] = None
+        concurrency_slot_acquired = False
+        openai_slot_acquired = False
+        mail_slot_acquired = False
         try:
+            control.checkpoint()
+            concurrency_slot_acquired = global_task_concurrency_limiter.acquire(
+                control.is_stop_requested
+            )
+            # 补 RT / 绑 2FA 都会调用 OpenAI；允许重新登录时可能等待邮箱验证码。
+            openai_slot_acquired = global_openai_limiter.acquire(control.is_stop_requested)
+            if getattr(handle_account, "uses_mail", False):
+                mail_slot_acquired = global_mail_limiter.acquire(control.is_stop_requested)
             control.checkpoint()
             attempt_id = control.start_attempt()
             _wait_turn(attempt_id)
@@ -871,44 +978,67 @@ def _run_account_batch_task(
             return AttemptResult.failed(str(e))
         finally:
             control.finish_attempt(attempt_id)
+            if account_proxy:
+                proxy_pool.release(account_proxy)
+            if mail_slot_acquired:
+                global_mail_limiter.release()
+            if openai_slot_acquired:
+                global_openai_limiter.release()
+            if concurrency_slot_acquired:
+                global_task_concurrency_limiter.release()
 
     try:
-        from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+        from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 
+        # 固定大小的 Future 窗口：账号数很大时内存仍只随并发数增长。
         max_workers = max(1, min(int(concurrency or 1), max(total, 1)))
+        next_index = 0
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [
-                pool.submit(_do_one, index, account_id)
-                for index, account_id in enumerate(account_ids)
-            ]
-            for f in as_completed(futures):
-                try:
-                    result = f.result()
-                except CancelledError:
-                    continue
-                except Exception as e:
-                    _log(task_id, f"[ERROR] 任务线程异常: {e}")
-                    errors.append(str(e))
-                    continue
-                if result.outcome == AttemptOutcome.SUCCESS:
-                    success += 1
-                elif result.outcome == AttemptOutcome.SKIPPED:
-                    skipped += 1
-                elif result.outcome == AttemptOutcome.STOPPED:
-                    stopped = True
-                else:
-                    errors.append(result.message)
-                _task_store.update_counters(
-                    task_id,
-                    success=success,
-                    registered=success + skipped + len(errors),
-                )
-                _persist_task_snapshot(task_id)
+            pending = set()
+
+            def _submit_next() -> bool:
+                nonlocal next_index
+                if next_index >= total or control.is_stop_requested():
+                    return False
+                pending.add(pool.submit(_do_one, next_index, account_ids[next_index]))
+                next_index += 1
+                return True
+
+            while len(pending) < max_workers and _submit_next():
+                pass
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    try:
+                        result = future.result()
+                    except CancelledError:
+                        continue
+                    except Exception as e:
+                        _log(task_id, f"[ERROR] 任务线程异常: {e}")
+                        errors.append(str(e))
+                    else:
+                        if result.outcome == AttemptOutcome.SUCCESS:
+                            success += 1
+                        elif result.outcome == AttemptOutcome.SKIPPED:
+                            skipped += 1
+                        elif result.outcome == AttemptOutcome.STOPPED:
+                            stopped = True
+                        else:
+                            errors.append(result.message)
+                    _task_store.update_counters(
+                        task_id,
+                        success=success,
+                        registered=success + skipped + len(errors),
+                    )
+                    _persist_task_snapshot(task_id)
+
                 if stopped or control.is_stop_requested():
                     stopped = True
-                    for pending in futures:
-                        if pending is not f:
-                            pending.cancel()
+                    for future in pending:
+                        future.cancel()
+                    continue
+                while len(pending) < max_workers and _submit_next():
+                    pass
     except Exception as e:
         _log(task_id, f"致命错误: {e}")
         _task_store.finish(
@@ -920,7 +1050,7 @@ def _run_account_batch_task(
             errors=errors,
             error=str(e),
         )
-        _persist_task_snapshot(task_id)
+        _persist_task_snapshot(task_id, force=True)
         _task_store.cleanup()
         return
 
@@ -935,7 +1065,7 @@ def _run_account_batch_task(
         skipped=skipped,
         errors=errors,
     )
-    _persist_task_snapshot(task_id)
+    _persist_task_snapshot(task_id, force=True)
     _task_store.cleanup()
 
 
@@ -981,6 +1111,8 @@ def _run_backfill_rt(task_id: str, account_ids: list[int], req: BackfillRtTaskRe
             detail={"action": "backfill_rt"},
         )
         return AttemptResult.failed(f"{email}: {result.summary()}")
+
+    _handle.uses_mail = req.allow_login
 
     _run_account_batch_task(
         task_id,
@@ -1043,6 +1175,8 @@ def _run_bind_2fa(task_id: str, account_ids: list[int], req: Bind2faTaskRequest)
         )
         return AttemptResult.failed(f"{email}: {result.summary()}")
 
+    _handle.uses_mail = req.allow_login
+
     _run_account_batch_task(
         task_id,
         account_ids,
@@ -1059,6 +1193,7 @@ def create_backfill_rt_task(req: BackfillRtTaskRequest, background_tasks: Backgr
     """批量给缺 refresh_token 的 ChatGPT 账号补 RT。"""
     from services.chatgpt_rt_backfill import select_backfill_targets
 
+    _validate_task_concurrency(req.concurrency)
     with Session(engine) as s:
         try:
             accounts, missing_ids = select_backfill_targets(
@@ -1111,6 +1246,7 @@ def create_bind_2fa_task(req: Bind2faTaskRequest, background_tasks: BackgroundTa
     """给库里已有的 ChatGPT 账号补绑 TOTP 2FA。"""
     from services.chatgpt_two_factor import select_two_factor_targets
 
+    _validate_task_concurrency(req.concurrency)
     with Session(engine) as s:
         try:
             accounts, missing_ids = select_two_factor_targets(
