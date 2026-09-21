@@ -1411,29 +1411,17 @@ class AuthFlow(PhoneRegisterMixin):
             return False
 
     def _rotate_impersonate_session(self) -> bool:
-        """仅在 curl_cffi 指纹模式内切换 UA 指纹版本重试，同时联动更新 UA。
+        """不在同一注册 / 补 RT 流程内切换指纹。
 
-        ⚠️ 这里必须连 self._fingerprint 里的 client hints 一起换掉。
-        旧版只更新了 self._ua 和 session —— 但 _common_headers / _navigation_headers
-        的 sec-ch-ua* 全是从 self._fingerprint 取的，于是换完会变成
-        「UA 说 Chrome/136、sec-ch-ua 说 v=146」，连 not_a_brand 都对不上
-        （三个版本各不相同："Not.A/Brand";v="99" / "Not/A)Brand";v="8" /
-        "Not?A_Brand";v="99"）—— 这正是上一轮刚消灭的「UA 与头自相矛盾」，
-        是 CF 最容易抓的特征。之前没爆只因这条路几乎没走到过。
-
-        fallback_impersonates 是**同家族**构造的（见 fingerprint.py 各 _gen_*），
-        所以只会 chrome→chrome、safari→safari，不会跨族；但同族换版本一样要同步头。
+        TLS、UA、Client Hints、Sentinel 浏览器参数和 cookie 必须来自同一份会话
+        指纹。TLS 异常交由上层重开完整流程（新邮箱/代理/会话）处理，而不是把
+        已经进行到一半的 Chrome/Safari 画像替换掉。
         """
-        if self._impersonate_idx >= len(self._impersonate_candidates) - 1:
-            return False
-        self._impersonate_idx += 1
-        imp = self._impersonate_candidates[self._impersonate_idx]
-        self._sync_fingerprint_to(imp)
-        logger.warning(f"TLS 异常，切换指纹重试: impersonate={imp}, ua={self._ua[:60]}...")
-        self.session = create_http_session(
-            proxy=self.config.proxy, impersonate=imp, user_agent=self._ua,
+        logger.warning(
+            "TLS 异常：保持当前流程指纹，不在会话内切换（impersonate=%s）",
+            self._fingerprint.get("impersonate", ""),
         )
-        return True
+        return False
 
     def _sync_fingerprint_to(self, impersonate: str) -> None:
         """换 impersonate 时把 UA 和 client hints 一起对齐。
@@ -1627,19 +1615,19 @@ class AuthFlow(PhoneRegisterMixin):
         **3/3 全成功**（各约 100s，password + access_token 齐全），409 = 0。
         """
         headers = self._navigation_headers()
-        family_fallbacks = cross_family_impersonates(self._fingerprint.get("impersonate", ""))
+        # warmup 可以重连，但必须复用本流程开始时确定的同一份指纹。
+        # 不可在这里切换浏览器家族，否则后续授权链与 warmup cookie 画像不一致。
+        fixed_impersonate = self._fingerprint.get("impersonate", "")
+        fixed_user_agent = self._ua
 
         for attempt in range(4):
             if attempt:
                 time.sleep(3 + attempt * 2)
-                # 换出口 IP（新 session = 新出口）的同时换浏览器家族
-                if family_fallbacks:
-                    self._switch_browser_family(family_fallbacks.pop(0))
-                    headers = self._navigation_headers()
+                # 仅创建新连接；TLS、UA 与请求头继续使用同一会话指纹。
                 self.session = create_http_session(
                     proxy=self.config.proxy,
-                    impersonate=self._impersonate_candidates[self._impersonate_idx],
-                    user_agent=self._ua,
+                    impersonate=fixed_impersonate,
+                    user_agent=fixed_user_agent,
                 )
             try:
                 resp = self.session.get(
@@ -1671,7 +1659,7 @@ class AuthFlow(PhoneRegisterMixin):
             )
 
         logger.error(
-            "warmup 4 次均未种到 oai-did cookie（已轮换浏览器家族）"
+            "warmup 4 次均未种到 oai-did cookie（始终保持同一指纹）"
             " —— 此时继续走注册链必然 409 invalid_state"
         )
         return False
@@ -1688,24 +1676,14 @@ class AuthFlow(PhoneRegisterMixin):
                 logger.info(f"网络正常 - IP: {ip.group(1) if ip else 'N/A'}, "
                             f"地区: {country_code or 'N/A'}")
 
-                # IP 地理联动：检测到国家码后，重新生成指纹（带时区/语言联动）
+                # IP 地理只用于记录，不能在已经创建 Session 后重新随机指纹。
+                # 否则注册 / 补 RT 的前半段和后半段会使用不同 TLS、UA 与硬件画像。
                 if country_code and country_code != self._country_code:
                     self._country_code = country_code
-                    import random
-                    session_seed = id(self.session) % (2**32)
-                    rng = random.Random(session_seed)
-                    self._fingerprint = generate_fingerprint(rng=rng, country_code=country_code)
-                    self._ua = self._fingerprint["user_agent"]
-                    new_imp = self._fingerprint["impersonate"]
-                    self._impersonate_candidates = self._fingerprint.get(
-                        "fallback_impersonates",
-                        [new_imp, "safari17_0", "safari15_5"],
-                    )
-                    self._impersonate_idx = 0
-                    self.session = create_http_session(
-                        proxy=self.config.proxy,
-                        impersonate=new_imp,
-                        user_agent=self._ua,
+                    logger.info(
+                        "网络地区已记录为 %s；本流程保持指纹: %s",
+                        country_code,
+                        self._fingerprint.get("impersonate", ""),
                     )
             else:
                 logger.warning(f"网络探测异常: cloudflare trace {resp.status_code}")

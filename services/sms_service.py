@@ -93,6 +93,26 @@ class BaseSmsProvider(ABC):
         """查询余额（货币随平台）。"""
         raise NotImplementedError
 
+    def _finish_activation(self, activation_id: str, *, reason: str = "") -> bool:
+        """确认号码已被业务侧使用后结束 activation，绝不能再走取消退款。"""
+        ok = False
+        try:
+            response = self._request({"action": "finishActivation", "id": activation_id})
+            ok = response.status_code in (200, 204) or "ACCESS" in response.text
+        except Exception:
+            try:
+                response = self._request({"action": "setStatus", "id": activation_id, "status": 6})
+                ok = "ACCESS" in response.text or response.status_code in (200, 204)
+            except Exception:
+                ok = False
+        logger.info(
+            "号码 activation_id=%s 结束%s（原因: %s）",
+            activation_id,
+            "成功" if ok else "失败",
+            (reason or "业务验证完成")[:80],
+        )
+        return ok
+
     def report_success(self, activation_id: str) -> bool:
         """业务侧验证通过后调用，平台据此结算并允许复用。"""
         return True
@@ -261,7 +281,9 @@ class SmsActivateProvider(BaseSmsProvider):
         self.default_service = str(default_service or SMS_DEFAULT_SERVICE).strip()
         self.default_country = str(default_country or SMS_DEFAULT_COUNTRY).strip()
         self.max_price = float(max_price or -1)
-        self.fixed_price = float(fixed_price or -1)
+        # 仅按 max_price 控制租号，固定价会要求恰好命中某个价位并无谓缩小库存。
+        # 保留构造参数以兼容旧调用，但不再用于请求。
+        self.fixed_price = -1.0
         self._proxy = (proxy or "").strip() or None
         self._proxies = {"http": self._proxy, "https": self._proxy} if self._proxy else None
         self.reuse_phone_to_max = bool(reuse_phone_to_max)
@@ -484,15 +506,8 @@ class SmsActivateProvider(BaseSmsProvider):
     def _request_number(self, action: str, service: str, country: str) -> dict:
         """单次调用 getNumberV2 或 getNumber，失败原样抛给调用方的双重循环。"""
         params = {"action": action, "service": service, "country": country}
-        if self.fixed_price > 0:
-            # HeroSMS 用 fixedPrice 开关；SmsBower 要求 minPrice == maxPrice 才算固定价
-            if "hero-sms.com" in self.base_url:
-                params["maxPrice"] = self.fixed_price
-                params["fixedPrice"] = "true"
-            else:
-                params["minPrice"] = self.fixed_price
-                params["maxPrice"] = self.fixed_price
-        elif self.max_price > 0:
+        # 唯一价格约束：服务端成交价不得超过用户设置的上限。
+        if self.max_price > 0:
             params["maxPrice"] = self.max_price
 
         logger.info(
@@ -827,15 +842,7 @@ class SmsActivateProvider(BaseSmsProvider):
 
         if not (should_finish or not holds_cache):
             return True
-        try:
-            resp = self._request({"action": "finishActivation", "id": activation_id})
-            return resp.status_code in (200, 204) or "ACCESS" in resp.text
-        except Exception:
-            try:
-                resp = self._request({"action": "setStatus", "id": activation_id, "status": 6})
-                return "ACCESS" in resp.text
-            except Exception:
-                return False
+        return self._finish_activation(activation_id, reason="手机号验证成功")
 
     def mark_code_failed(self, activation_id: str, reason: str = "") -> None:
         with _SMS_CACHE_LOCK:
@@ -854,6 +861,7 @@ class SmsActivateProvider(BaseSmsProvider):
             pass
 
     def stop_reuse(self, activation_id: str, reason: str = "") -> None:
+        # OpenAI 已创建账号或已接受手机号：不能 cancel（那是退款路径），必须结算。
         with _SMS_CACHE_LOCK:
             cache = _SMS_CACHE
             if cache and str(cache.get("activation_id")) == str(activation_id):
@@ -861,6 +869,7 @@ class SmsActivateProvider(BaseSmsProvider):
                 cache["stop_reason"] = reason or "号码已被业务侧占用"
                 self._save_cache(cache)
                 self._clear_cache()
+        self._finish_activation(activation_id, reason=reason or "手机号已被业务侧占用")
 
     def mark_send_failed(self, activation_id: str, reason: str = "") -> None:
         # 业务侧拒了这个号 → cancel 退款，号根本没用上，不能白花钱
@@ -990,45 +999,41 @@ class PhoneCallbackController:
         return self.activation.phone_number
 
     def _resolve_country_candidates(self, provider: BaseSmsProvider) -> list[str]:
-        allowed_raw = str(self.config.get("sms_allowed_countries") or "").strip()
-        allowed = [c.strip() for c in allowed_raw.replace(";", ",").split(",") if c.strip()]
+        """只按价格上限从全平台当前有库存的国家中自动租号。"""
+        if not isinstance(provider, SmsActivateProvider):
+            return [SMS_DEFAULT_COUNTRY]
 
-        if not (self.auto_select_country and isinstance(provider, SmsActivateProvider)):
-            return [self.country] if self.country else [SMS_DEFAULT_COUNTRY]
-
-        if allowed:
-            self.log(f"自动选号: 从勾选的 {len(allowed)} 个国家按价格升序依次尝试")
-            try:
-                rows = provider.get_top_countries(service=self.service)
-            except Exception as exc:
-                self.log(f"排名查询失败（{exc}），按勾选的原始顺序尝试")
-                return list(allowed)
-            ranked = [str(r["country"]) for r in rows if str(r.get("country") or "") in allowed]
-            candidates = ranked + [c for c in allowed if c not in ranked]
-            self.log(f"候选顺序: {','.join(candidates)}")
-            return candidates or [SMS_DEFAULT_COUNTRY]
-
-        self.log("自动选号: 未指定允许国家，按全平台价格 + 库存挑最优")
+        price_cap = _safe_float(
+            self.config.get("sms_max_price") or self.config.get("sms_auto_max_price"),
+            0,
+        )
+        self.log(
+            "自动选号: 全平台按价格升序尝试"
+            f"（价格上限 {price_cap if price_cap > 0 else '不限'}）"
+        )
         try:
-            best = provider.get_best_country(
-                service=self.service,
-                min_stock=_safe_int(self.config.get("sms_auto_min_stock"), 20),
-                max_price=_safe_float(self.config.get("sms_auto_max_price"), 0),
-                strict_whitelist=_safe_bool(self.config.get("sms_strict_whitelist"), False),
-            )
+            rows = provider.get_top_countries(service=self.service)
         except Exception as exc:
-            self.log(f"国家智能选择失败（{exc}），使用默认国家")
-            best = ""
-        if best:
-            in_whitelist = best in OPENAI_SMS_COUNTRIES
-            self.log(
-                f"自动选择国家: {country_label(best)} "
-                f"[{'OpenAI SMS 白名单' if in_whitelist else '非白名单，可能走 WhatsApp'}]"
-            )
-            return [best]
+            self.log(f"国家价格/库存查询失败（{exc}），无法自动租号")
+            raise RuntimeError("无法获取接码国家价格与库存") from exc
 
-        self.log("未找到满足条件的国家，使用默认国家")
-        return [self.country] if self.country else [SMS_DEFAULT_COUNTRY]
+        candidates: list[str] = []
+        for row in rows:
+            country = str(row.get("country") or "").strip()
+            price = _safe_float(row.get("price"), -1)
+            stock = _safe_int(row.get("count"), 0)
+            if not country or price < 0 or stock <= 0:
+                continue
+            if price_cap > 0 and price > price_cap:
+                continue
+            candidates.append(country)
+        if not candidates:
+            if price_cap > 0:
+                raise RuntimeError(f"没有单价不超过 {price_cap} 且当前有库存的可用国家")
+            raise RuntimeError("当前服务暂无可用库存")
+        preview = ",".join(f"{country_label(c)}" for c in candidates[:8])
+        self.log(f"自动选号候选: {preview}{' …' if len(candidates) > 8 else ''}")
+        return candidates
 
     def get_code(self, timeout: int = 180) -> str:
         """阶段 2：等待短信验证码。"""
@@ -1072,18 +1077,28 @@ class PhoneCallbackController:
                 pass
 
     def mark_send_failed(self, reason: str = "") -> None:
+        """OpenAI 明确未接受号码时取消 activation，并避免 cleanup 二次退号。"""
         if self.activation and self.provider:
+            activation_id = self.activation.activation_id
             try:
-                self.provider.mark_send_failed(self.activation.activation_id, reason=reason)
+                self.provider.mark_send_failed(activation_id, reason=reason)
             except Exception:
-                pass
+                logger.warning("取消不可用号码 activation 失败: %s", activation_id, exc_info=True)
+            finally:
+                # 无论平台请求是否抛异常，本次号码都不能再被复用；后续 cleanup
+                # 也不再对同一个 activation 发送第二次 cancel。
+                self.activation = None
+                self._release_lock()
 
     def stop_reuse(self, reason: str = "") -> None:
+        """号码已经被 OpenAI 接受：结束结算并阻止 finally 再执行 cancel。"""
         if self.activation and self.provider:
             try:
                 self.provider.stop_reuse(self.activation.activation_id, reason=reason)
             except Exception:
-                pass
+                logger.warning("结束已使用号码 activation 失败", exc_info=True)
+            self.completed = True
+        self._release_lock()
 
     def cleanup(self) -> None:
         """流程结束（成功或失败）调用：释放未完成的号并解锁。"""
@@ -1149,9 +1164,10 @@ def build_phone_callback(
             provider_key=str(settings.get("sms_provider") or "smsbower"),
             config=settings,
             service=str(settings.get("sms_service") or "").strip() or SMS_DEFAULT_SERVICE,
-            country=str(settings.get("sms_country") or "").strip() or SMS_DEFAULT_COUNTRY,
+            # 始终根据库存和价格自动选择国家；不再读取 sms_country / 白名单。
+            country="",
             log_fn=log_fn,
-            auto_select_country=_safe_bool(settings.get("sms_auto_country"), False),
+            auto_select_country=True,
         )
     except Exception as exc:
         logger.warning("创建接码控制器失败: %s", exc)

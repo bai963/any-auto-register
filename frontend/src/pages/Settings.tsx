@@ -17,7 +17,6 @@ import {
 } from '@ant-design/icons'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { ICLOUD_REGION_OPTIONS } from '@/lib/icloud'
-import { parseCountryIdList } from '@/lib/smsCountries'
 import SmsCountrySelect from '@/components/SmsCountrySelect'
 import MailImportPanel from '@/components/settings/MailImportPanel'
 import {
@@ -88,7 +87,7 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   ],
 }
 
-const SMS_BOOLEAN_KEYS = ['sms_enabled', 'sms_auto_country', 'sms_reuse_phone'] as const
+const SMS_BOOLEAN_KEYS = ['sms_enabled', 'sms_reuse_phone'] as const
 
 const TAB_ITEMS = [
   {
@@ -345,27 +344,10 @@ const TAB_ITEMS = [
         ],
       },
       {
-        title: '国家选择',
-        desc: 'OpenAI 自 2025 年起对多数国家改用 WhatsApp 验证，实测只有泰国（52）走纯短信稳定可用',
-        fields: [
-          { key: 'sms_country', label: '默认国家', type: 'country', placeholder: '默认泰国 (52)' },
-          { key: 'sms_auto_country', label: '自动选最优国家', type: 'boolean' },
-          {
-            key: 'sms_allowed_countries',
-            label: '允许的国家（可选）',
-            type: 'country-multi',
-            placeholder: '留空则全平台自由选',
-          },
-          { key: 'sms_auto_min_stock', label: '自动选号最低库存', placeholder: '20' },
-          { key: 'sms_auto_max_price', label: '自动选号价格上限', placeholder: '0 表示不限' },
-        ],
-      },
-      {
         title: '租号与重试',
         desc: '单号窗口内只轮询接码平台收码，窗口用尽则换号',
         fields: [
-          { key: 'sms_max_price', label: '单号价格上限', placeholder: '留空或 0 表示不限' },
-          { key: 'sms_fixed_price', label: '固定价格', placeholder: '留空表示不锁价' },
+          { key: 'sms_max_price', label: '智能选号价格上限', placeholder: '留空或 0 表示不限' },
           { key: 'sms_reuse_phone', label: '复用同一号码', type: 'boolean' },
           { key: 'sms_phone_success_max', label: '单号复用上限', placeholder: '3' },
           { key: 'sms_per_phone_timeout', label: '单号等待秒数', placeholder: '80' },
@@ -1427,7 +1409,7 @@ export default function Settings() {
         data[key] = parseBooleanConfigValue(data[key])
       }
       // 库里存的是 "52,4,10"，下拉要的是数组
-      data.sms_allowed_countries = parseCountryIdList(data.sms_allowed_countries)
+
       if (!String(data.email_domain_level_count ?? '').trim()) {
         data.email_domain_level_count = 2
       }
@@ -1500,8 +1482,6 @@ export default function Settings() {
       for (const key of SMS_BOOLEAN_KEYS) {
         values[key] = parseBooleanConfigValue(values[key])
       }
-      const allowedCountries = parseCountryIdList(values.sms_allowed_countries)
-      values.sms_allowed_countries = allowedCountries.join(',')
       const rawDomainLevelCount = Number.parseInt(String(values.email_domain_level_count ?? '').trim(), 10)
       if (values.mail_provider === 'cfworker' && values.email_domain_rule_enabled) {
         if (!Number.isInteger(rawDomainLevelCount) || rawDomainLevelCount < 2) {
@@ -1528,7 +1508,6 @@ export default function Settings() {
         cfworker_random_name_subdomain: values.cfworker_random_name_subdomain,
         email_domain_rule_enabled: values.email_domain_rule_enabled,
         email_domain_level_count: values.email_domain_level_count,
-        sms_allowed_countries: allowedCountries,
         ...Object.fromEntries(SMS_BOOLEAN_KEYS.map((key) => [key, values[key]])),
       })
       message.success('保存成功')

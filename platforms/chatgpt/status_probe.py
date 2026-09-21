@@ -233,6 +233,52 @@ def _probe_codex_usage(access_token: str, account_id: str, proxy: Optional[str])
     return _perform_get(CODEX_USAGE_URL, headers=headers, proxy=proxy)
 
 
+def _as_number(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+        return parsed if parsed >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_usage_window(value: Any) -> dict[str, Any]:
+    """兼容 wham/usage 不同版本的主/次额度窗口字段。"""
+    data = value if isinstance(value, dict) else {}
+    used_percent = _as_number(data.get("used_percent", data.get("usedPercentage", data.get("used"))))
+    remaining_percent = _as_number(data.get("remaining_percent", data.get("remainingPercentage", data.get("remaining"))))
+    if used_percent is not None and used_percent <= 1:
+        used_percent *= 100
+    if remaining_percent is not None and remaining_percent <= 1:
+        remaining_percent *= 100
+    if remaining_percent is None and used_percent is not None:
+        remaining_percent = max(0.0, min(100.0, 100.0 - used_percent))
+    if used_percent is None and remaining_percent is not None:
+        used_percent = max(0.0, min(100.0, 100.0 - remaining_percent))
+    reset_at = data.get("reset_at", data.get("resetAt", data.get("resets_at", data.get("reset_time", ""))))
+    return {
+        "used_percent": round(used_percent, 2) if used_percent is not None else None,
+        "remaining_percent": round(remaining_percent, 2) if remaining_percent is not None else None,
+        "reset_at": str(reset_at or ""),
+    }
+
+
+def _extract_codex_usage(payload: dict[str, Any]) -> dict[str, Any]:
+    """保存 wham/usage 原始响应并抽取主、次额度窗口。
+
+    接口字段曾出现 rate_limit / rate_limits、primary_window / primaryWindow 等变体，
+    因而只规范展示字段，原始 JSON 同时保留在 raw 便于后续兼容新格式。
+    """
+    root = payload.get("rate_limit") or payload.get("rate_limits") or payload
+    root = root if isinstance(root, dict) else {}
+    primary = root.get("primary_window", root.get("primaryWindow", root.get("primary", {})))
+    secondary = root.get("secondary_window", root.get("secondaryWindow", root.get("secondary", {})))
+    return {
+        "primary": _normalize_usage_window(primary),
+        "secondary": _normalize_usage_window(secondary),
+        "raw": payload,
+    }
+
+
 def _extract_oai_device_id(account: Any) -> str:
     """优先用账号自己的 oai-did，没有就按邮箱派生一个固定值。
 
@@ -426,6 +472,7 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
             "error_code": "",
             "message": "",
             "chatgpt_account_id": account_id,
+            "usage": {},
         },
     }
 
@@ -499,6 +546,7 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
         )
         if codex_result.status_code == 200:
             result["codex"]["state"] = "usable"
+            result["codex"]["usage"] = _extract_codex_usage(codex_result.body_json)
         elif codex_result.status_code == 401:
             if codex_result.error_code == "token_invalidated":
                 result["codex"]["state"] = "access_token_invalidated"

@@ -175,6 +175,34 @@ function codexStateMeta(state?: string) {
   }
 }
 
+function formatUsageResetDate(value: unknown): string {
+  if (!value) return ''
+  const raw = String(value).trim()
+  if (!raw) return ''
+  const numeric = Number(raw)
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric < 10_000_000_000 ? numeric * 1000 : numeric)
+    : new Date(raw)
+  if (Number.isNaN(date.getTime())) return raw
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+function usageWindowText(window: any): string {
+  const remaining = Number(window?.remaining_percent)
+  if (!Number.isFinite(remaining)) return '-'
+  const reset = formatUsageResetDate(window?.reset_at)
+  return `${remaining.toFixed(remaining % 1 === 0 ? 0 : 1)}%${reset ? ` · 重置 ${reset}` : ''}`
+}
+
+function usageTagColor(window: any): string {
+  const remaining = Number(window?.remaining_percent)
+  if (!Number.isFinite(remaining)) return 'default'
+  if (remaining <= 0) return 'error'
+  if (remaining < 20) return 'warning'
+  return 'success'
+}
+
 const PLUS_TRIAL_FILTERS = [
   { value: 'trial_eligible', label: '可领首月免费' },
   { value: 'plus_active', label: 'Plus 生效中' },
@@ -327,6 +355,8 @@ function LocalProbeSummary({ probe }: { probe: any }) {
       <SummaryField label="认证信息" value={auth.message} code />
       <SummaryField label="工作区套餐" value={subscription.workspace_plan_type} />
       <SummaryField label="Codex 信息" value={codex.message} code />
+      <SummaryField label="主额度" value={usageWindowText(codex.usage?.primary)} />
+      <SummaryField label="次额度" value={usageWindowText(codex.usage?.secondary)} />
     </div>
   )
 }
@@ -1143,6 +1173,7 @@ export default function Accounts() {
       allow_login: values.allow_login !== false,
       concurrency: Number(values.concurrency) || 1,
       delay_seconds: Number(values.delay_seconds) || 0,
+      sms_max_phone_attempts: Number(values.sms_max_phone_attempts) || 0,
     }
 
     if (scope === 'selected') {
@@ -1226,13 +1257,23 @@ export default function Accounts() {
     border: `1px solid ${token.colorBorder}`,
     background: token.colorFillAlter,
   }
+  // ChatGPT 列字段多，单独收紧间距和卡片内边距，避免状态标签把行高撑大。
+  const chatgptCellStackStyle: React.CSSProperties = {
+    ...cellStackStyle,
+    gap: 3,
+  }
+  const chatgptCompactPanelStyle: React.CSSProperties = {
+    ...compactPanelStyle,
+    padding: '5px 7px',
+    borderRadius: token.borderRadius,
+  }
 
   const columns: any[] = [
     {
       title: '邮箱',
       dataIndex: 'email',
       key: 'email',
-      width: 260,
+      width: isChatgptPlatform ? 210 : 260,
       render: (text: string, record: any) => (
         <div style={cellStackStyle}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
@@ -1254,7 +1295,7 @@ export default function Accounts() {
       title: '密码',
       dataIndex: 'password',
       key: 'password',
-      width: 150,
+      width: isChatgptPlatform ? 118 : 150,
       render: (text: string) => (
         <div style={secretCellStyle}>
           <Text style={secretPreviewStyle} title={text}>
@@ -1267,7 +1308,7 @@ export default function Accounts() {
     {
       title: 'RT',
       key: 'refresh_token',
-      width: 150,
+      width: isChatgptPlatform ? 118 : 150,
       render: (_: any, record: any) => {
         const rt = getRefreshToken(record)
         if (!rt) return <span style={{ color: 'var(--text-muted)' }}>-</span>
@@ -1285,7 +1326,7 @@ export default function Accounts() {
       title: '状态',
       dataIndex: 'status',
       key: 'status',
-      width: 110,
+      width: isChatgptPlatform ? 88 : 110,
       render: (status: string) => <Tag color={STATUS_COLORS[status] || 'default'}>{status}</Tag>,
     },
   ]
@@ -1295,7 +1336,7 @@ export default function Accounts() {
       {
         title: '本地状态',
         key: 'chatgpt_local_state',
-        width: 320,
+        width: 260,
         render: (_: any, record: any) => {
           const auth = record.chatgptLocal?.auth || {}
           const subscription = record.chatgptLocal?.subscription || {}
@@ -1309,13 +1350,13 @@ export default function Accounts() {
           const sub2apiMeta = uploadSyncMeta(sub2apiSync)
 
           return (
-            <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            <div style={{ ...chatgptCellStackStyle, ...chatgptCompactPanelStyle }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
                 <Tag color={authMeta.color}>{authMeta.label}</Tag>
                 <Tag color={planTag.color}>{planTag.label}</Tag>
                 <Tag color={codexMeta.color}>Codex {codexMeta.label}</Tag>
               </div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
                 <Tag color={cpaMeta.color} title={uploadSyncTitle('CPA', cpaSync)}>
                   CPA {cpaMeta.label}
                 </Tag>
@@ -1341,15 +1382,35 @@ export default function Accounts() {
         },
       },
       {
+        title: 'Codex 额度',
+        key: 'codex_usage',
+        width: 145,
+        render: (_: unknown, record: any) => {
+          const usage = record.chatgptLocal?.codex?.usage || {}
+          const primary = usage.primary || {}
+          const secondary = usage.secondary || {}
+          return (
+            <div style={{ ...chatgptCellStackStyle, ...chatgptCompactPanelStyle, gap: 2 }}>
+              <Tag color={usageTagColor(primary)} title={usageWindowText(primary)}>
+                主 {usageWindowText(primary)}
+              </Tag>
+              <Tag color={usageTagColor(secondary)} title={usageWindowText(secondary)}>
+                次 {usageWindowText(secondary)}
+              </Tag>
+            </div>
+          )
+        },
+      },
+      {
         title: 'Plus 试用',
         key: 'plus_check',
-        width: 140,
+        width: 118,
         render: (_: unknown, record: { plusCheck?: PlusCheck }) => {
           const check = record.plusCheck || {}
           const meta = plusTrialMeta(check.status)
           const checkedAt = formatSyncTime(check.checked_at)
           return (
-            <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
+            <div style={{ ...chatgptCellStackStyle, ...chatgptCompactPanelStyle }}>
               <Tag color={meta.color} title={check.message || ''}>
                 {meta.label}
               </Tag>
@@ -1411,7 +1472,7 @@ export default function Accounts() {
       title: '注册时间',
       dataIndex: 'created_at',
       key: 'created_at',
-      width: 132,
+      width: isChatgptPlatform ? 112 : 132,
       render: (text: string) => {
         const formatted = formatCreatedAt(text)
         return (
@@ -1425,7 +1486,7 @@ export default function Accounts() {
     {
       title: '操作',
       key: 'action',
-      width: 150,
+      width: isChatgptPlatform ? 126 : 150,
       fixed: isChatgptPlatform ? 'right' : undefined,
       render: (_: any, record: any) => (
         <Space size={4} wrap>
@@ -1627,7 +1688,7 @@ export default function Accounts() {
             setPageSize(nextPageSize)
           },
         }}
-        scroll={{ x: isChatgptPlatform ? 1300 : 980 }}
+        scroll={{ x: isChatgptPlatform ? 1180 : 980 }}
         onRow={(record) => ({
           onDoubleClick: () => {
             setCurrentAccount(record)
@@ -1749,6 +1810,14 @@ export default function Accounts() {
                 extra="最高 200；超过 10 并发需配置 PostgreSQL。高并发会增加 OpenAI 风控风险，建议设置间隔为 0 前确认代理资源充足。"
               >
                 <InputNumber min={1} max={200} precision={0} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item
+                name="sms_max_phone_attempts"
+                label="每个账号租号次数"
+                initialValue={3}
+                extra="补 RT 遇到 OpenAI 要求绑定手机时，单个账号最多租用的新号码数；0 表示不自动租号。"
+              >
+                <InputNumber min={0} max={20} precision={0} style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item
                 name="delay_seconds"

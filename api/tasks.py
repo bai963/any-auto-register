@@ -92,6 +92,8 @@ class BackfillRtTaskRequest(BaseModel):
     allow_login: bool = True
     concurrency: int = Field(default=1, ge=1, le=MAX_TASK_CONCURRENCY)
     delay_seconds: float = Field(default=5, ge=0)
+    # 补 RT 的协议链若遇到 add-phone，单个账号最多可新租的号码数；0 = 不租号。
+    sms_max_phone_attempts: int = Field(default=3, ge=0, le=20)
     proxy: Optional[str] = None
 
 
@@ -1076,6 +1078,8 @@ def _run_backfill_rt(task_id: str, account_ids: list[int], req: BackfillRtTaskRe
     from services.chatgpt_rt_backfill import apply_backfill_result, backfill_account_data
 
     base_config = config_store.get_all() or {}
+    # 仅作用于本次补 RT，不能修改全局接码配置。
+    base_config["sms_max_phone_attempts"] = str(req.sms_max_phone_attempts)
 
     def _handle(*, account_id, fields, proxy, control, attempt_id) -> AttemptResult:
         email = fields["email"]
@@ -1230,6 +1234,7 @@ def create_backfill_rt_task(req: BackfillRtTaskRequest, background_tasks: Backgr
             "allow_login": req.allow_login,
             "concurrency": req.concurrency,
             "delay_seconds": req.delay_seconds,
+            "sms_max_phone_attempts": req.sms_max_phone_attempts,
             "missing_ids": missing_ids,
         },
     )
