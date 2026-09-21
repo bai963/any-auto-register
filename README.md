@@ -91,7 +91,7 @@
 
 | 层级 | 技术 |
 | --- | --- |
-| 后端 | FastAPI + SQLite（SQLModel） |
+| 后端 | FastAPI + SQLModel（SQLite / PostgreSQL） |
 | 前端 | React + TypeScript + Vite |
 | HTTP | curl_cffi |
 | 浏览器自动化 | Playwright / Camoufox |
@@ -455,7 +455,7 @@ docker compose logs -f app
 容器默认使用：
 
 ```text
-DATABASE_URL=sqlite:////app/data/account_manager.db
+DATABASE_URL=sqlite:////runtime/account_manager.db
 ```
 
 宿主机会挂载到：
@@ -470,7 +470,7 @@ DATABASE_URL=sqlite:////app/data/account_manager.db
 | --- | --- | --- |
 | `HOST` | `0.0.0.0` | FastAPI 监听地址 |
 | `PORT` | `8000` | FastAPI 监听端口 |
-| `DATABASE_URL` | `sqlite:////app/data/account_manager.db` | SQLite 数据库地址 |
+| `DATABASE_URL` | `sqlite:////runtime/account_manager.db` | SQLite 或 PostgreSQL 数据库地址，详见 [PostgreSQL 支持](docs/POSTGRESQL.md) |
 | `APP_ENABLE_SOLVER` | `1` | 是否自动启动本地 Solver，设为 `0` 可禁用 |
 | `SOLVER_PORT` | `8889` | Solver 监听端口 |
 | `LOCAL_SOLVER_URL` | `http://127.0.0.1:8889` | 后端访问 Solver 的地址 |

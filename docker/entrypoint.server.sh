@@ -8,7 +8,11 @@ APP_DIR="/app"
 RUNTIME_DIR="${APP_RUNTIME_DIR:-/runtime}"
 
 mkdir -p "${RUNTIME_DIR}" "${RUNTIME_DIR}/logs"
-touch "${RUNTIME_DIR}/account_manager.db"
+
+# 仅 SQLite 使用挂载目录中的数据库文件；PostgreSQL 不创建本地 .db 文件。
+case "${DATABASE_URL:-sqlite:////runtime/account_manager.db}" in
+  sqlite:*) touch "${RUNTIME_DIR}/account_manager.db" ;;
+esac
 
 # 凭据加密密钥必须和数据库一起留在挂载卷里。放在镜像内的默认位置（/app/.secrets）
 # 会在每次重建容器时重新生成，导致库里已加密的 iCloud/ChatGPT 凭据全部解不开
@@ -16,7 +20,9 @@ touch "${RUNTIME_DIR}/account_manager.db"
 mkdir -p "$(dirname "${CREDENTIAL_ENCRYPTION_KEY_FILE:-${RUNTIME_DIR}/.secrets/credential_key}")"
 chmod 700 "$(dirname "${CREDENTIAL_ENCRYPTION_KEY_FILE:-${RUNTIME_DIR}/.secrets/credential_key}")"
 
-ln -sfn "${RUNTIME_DIR}/account_manager.db" "${APP_DIR}/account_manager.db"
+case "${DATABASE_URL:-sqlite:////runtime/account_manager.db}" in
+  sqlite:*) ln -sfn "${RUNTIME_DIR}/account_manager.db" "${APP_DIR}/account_manager.db" ;;
+esac
 
 if ! command -v node >/dev/null 2>&1; then
   echo "[entrypoint] 警告: 找不到 node，ChatGPT 的 Sentinel PoW 无法求解，注册会收不到验证码" >&2

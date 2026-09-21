@@ -2,6 +2,8 @@ fastapi>=0.110.0
 uvicorn>=0.29.0
 quart>=0.19.4
 sqlmodel>=0.0.16
+# PostgreSQL 驱动；DATABASE_URL 使用 postgresql+psycopg:// 时自动启用
+psycopg[binary]>=3.2.0
 curl-cffi>=0.16.2,<0.17
 requests>=2.31.0
 pysocks>=1.7.1

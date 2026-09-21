@@ -5,11 +5,16 @@ APP_DIR="/app"
 RUNTIME_DIR="${APP_RUNTIME_DIR:-/runtime}"
 
 mkdir -p "${RUNTIME_DIR}" "${RUNTIME_DIR}/logs"
-touch \
-  "${RUNTIME_DIR}/account_manager.db" \
-  "${RUNTIME_DIR}/logs/solver.log"
+touch "${RUNTIME_DIR}/logs/solver.log"
 
-ln -sfn "${RUNTIME_DIR}/account_manager.db" "${APP_DIR}/account_manager.db"
+# 仅 SQLite 需要本地数据库文件。PostgreSQL 的 DATABASE_URL 指向独立服务，
+# 不能创建或覆盖本地 account_manager.db。
+case "${DATABASE_URL:-sqlite:////runtime/account_manager.db}" in
+  sqlite:*)
+    touch "${RUNTIME_DIR}/account_manager.db"
+    ln -sfn "${RUNTIME_DIR}/account_manager.db" "${APP_DIR}/account_manager.db"
+    ;;
+esac
 ln -sfn "${RUNTIME_DIR}/logs/solver.log" "${APP_DIR}/services/turnstile_solver/solver.log"
 
 # 凭据加密密钥必须和数据库一起留在挂载卷里。放在镜像内的默认位置（/app/.secrets）

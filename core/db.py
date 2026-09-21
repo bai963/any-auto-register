@@ -1,9 +1,11 @@
-"""数据库模型 - SQLite via SQLModel"""
+"""数据库模型 - SQLModel（支持 SQLite 与 PostgreSQL）"""
 from datetime import datetime, timezone
 import os
 import secrets
 from typing import Optional
 from sqlmodel import Field, SQLModel, create_engine, Session, select
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 import json
 
 
@@ -15,8 +17,27 @@ def new_alias_share_token() -> str:
     """128 位随机串，够长到不能枚举，又短到能塞进一行链接里。"""
     return secrets.token_urlsafe(16)
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///account_manager.db")
-engine = create_engine(DATABASE_URL)
+# SQLite 保持零配置默认值；生产环境可使用：
+# postgresql+psycopg://USER:PASSWORD@HOST:5432/DBNAME
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///account_manager.db").strip()
+
+try:
+    _database_url = make_url(DATABASE_URL)
+except ArgumentError as exc:
+    raise RuntimeError("DATABASE_URL 格式无效，请使用 SQLite 或 PostgreSQL SQLAlchemy URL") from exc
+
+_database_backend = _database_url.get_backend_name()
+if _database_backend not in {"sqlite", "postgresql"}:
+    raise RuntimeError(
+        f"不支持的数据库类型: {_database_backend}。当前仅支持 SQLite 和 PostgreSQL。"
+    )
+
+# PostgreSQL 是多连接服务，连接断开（数据库重启、网络抖动）后应自动探活重连。
+# SQLite 不传连接池参数，保留其单机文件数据库的默认行为。
+_engine_options = {"pool_pre_ping": True} if _database_backend == "postgresql" else {
+    "connect_args": {"check_same_thread": False},
+}
+engine = create_engine(DATABASE_URL, **_engine_options)
 
 
 class AccountModel(SQLModel, table=True):

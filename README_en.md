@@ -84,7 +84,7 @@ Thank you to the following friends and partners for supporting any-auto-register
 
 | Layer | Technology |
 | --- | --- |
-| Backend | FastAPI + SQLite (SQLModel) |
+| Backend | FastAPI + SQLModel (SQLite / PostgreSQL) |
 | Frontend | React + TypeScript + Vite |
 | HTTP | curl_cffi |
 | Browser Automation | Playwright / Camoufox |
@@ -443,7 +443,7 @@ docker compose logs -f app
 The container defaults to:
 
 ```text
-DATABASE_URL=sqlite:////app/data/account_manager.db
+DATABASE_URL=sqlite:////runtime/account_manager.db
 ```
 
 The host machine mounts to:
@@ -458,7 +458,7 @@ The host machine mounts to:
 | --- | --- | --- |
 | `HOST` | `0.0.0.0` | FastAPI listen address |
 | `PORT` | `8000` | FastAPI listen port |
-| `DATABASE_URL` | `sqlite:////app/data/account_manager.db` | SQLite database path |
+| `DATABASE_URL` | `sqlite:////runtime/account_manager.db` | SQLite or PostgreSQL database URL; see [PostgreSQL support](docs/POSTGRESQL.md) |
 | `APP_ENABLE_SOLVER` | `1` | Whether to auto-start Solver, set to `0` to disable |
 | `SOLVER_PORT` | `8889` | Solver listen port |
 | `LOCAL_SOLVER_URL` | `http://127.0.0.1:8889` | Backend access URL for Solver |
