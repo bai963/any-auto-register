@@ -3116,15 +3116,54 @@ class OutlookMailboxBackend(ABC):
 class OutlookImapMailboxBackend(OutlookMailboxBackend):
     backend_name = "imap"
 
+    def __init__(self, mailbox):
+        super().__init__(mailbox)
+        # 某些 Outlook IMAP 服务并没有 Deleted Items / Trash，失败后不应在每轮
+        # 5 秒轮询中重复刷错误日志。进程内缓存即可，重新启动后会重新探测。
+        self._unsupported_folders: set[str] = set()
+        self._folder_lock = threading.Lock()
+
+    @staticmethod
+    def _imap_mailbox_argument(folder: str) -> str:
+        """为 IMAP mailbox 参数加引号。
+
+        imaplib.select("Deleted Items") 会直接发出 ``SELECT Deleted Items``，服务端
+        将空格后的 Items 视为第二个命令参数并返回 BAD Command Argument Error。
+        这里按 IMAP quoted-string 规则转义后发 ``SELECT "Deleted Items"``。
+        """
+        name = str(folder or "")
+        if not name:
+            return name
+        if any(char.isspace() for char in name) or any(char in name for char in ('"', '\\')):
+            return '"' + name.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        return name
+
     def _select_folder(self, imap_conn, folder: str):
-        """Prefer read-only selection, then fall back to SELECT for Outlook IMAP."""
+        """以正确的 mailbox 参数选择文件夹；只读失败时再尝试读写 SELECT。"""
+        mailbox_arg = self._imap_mailbox_argument(folder)
         try:
-            return imap_conn.select(folder, readonly=True)
-        except Exception as exc:
-            self.mailbox._log(
-                f"[微软邮箱][IMAP] folder={folder} EXAMINE 失败，改用 SELECT: {exc}"
-            )
-            return imap_conn.select(folder, readonly=False)
+            return imap_conn.select(mailbox_arg, readonly=True)
+        except Exception as readonly_error:
+            try:
+                return imap_conn.select(mailbox_arg, readonly=False)
+            except Exception as select_error:
+                # 将两个错误组合抛给调用方，只记录一次，而不是每轮两条 EXAMINE/SELECT。
+                raise RuntimeError(
+                    f"EXAMINE: {readonly_error}; SELECT: {select_error}"
+                ) from select_error
+
+    def _is_unsupported(self, folder: str) -> bool:
+        with self._folder_lock:
+            return folder in self._unsupported_folders
+
+    def _mark_unsupported(self, folder: str, error: Exception | str) -> None:
+        with self._folder_lock:
+            if folder in self._unsupported_folders:
+                return
+            self._unsupported_folders.add(folder)
+        self.mailbox._log(
+            f"[微软邮箱][IMAP] folder={folder} 不可用，后续轮询跳过: {error}"
+        )
 
     def get_current_ids(self, account: MailboxAccount) -> set:
         imap_conn = None
@@ -3132,12 +3171,12 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
             imap_conn = self.mailbox._open_imap(account)
             seen: set[str] = set()
             for folder in self.mailbox._imap_folder_names:
+                if self._is_unsupported(folder):
+                    continue
                 try:
                     status, _ = self._select_folder(imap_conn, folder)
                 except Exception as exc:
-                    self.mailbox._log(
-                        f"[微软邮箱][IMAP] folder={folder} select 失败，跳过: {exc}"
-                    )
+                    self._mark_unsupported(folder, exc)
                     continue
                 if status != "OK":
                     continue
@@ -3189,16 +3228,20 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
 
         def poll_once() -> Optional[str]:
             for folder in self.mailbox._imap_folder_names:
+                if self._is_unsupported(folder):
+                    continue
                 imap_conn = None
                 try:
                     self.mailbox._log(f"[微软邮箱][IMAP] folder={folder} 开始轮询")
                     imap_conn = self.mailbox._open_imap(account)
                     self.mailbox._log(f"[微软邮箱][IMAP] folder={folder} IMAP 登录成功")
-                    status, _ = self._select_folder(imap_conn, folder)
+                    try:
+                        status, _ = self._select_folder(imap_conn, folder)
+                    except Exception as exc:
+                        self._mark_unsupported(folder, exc)
+                        continue
                     if status != "OK":
-                        self.mailbox._log(
-                            f"[微软邮箱][IMAP] folder={folder} select 失败: status={status}"
-                        )
+                        self._mark_unsupported(folder, f"SELECT status={status}")
                         continue
                     status, data = imap_conn.uid("search", None, "ALL")
                     if status != "OK":

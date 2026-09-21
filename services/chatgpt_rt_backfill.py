@@ -22,9 +22,20 @@ logger = logging.getLogger(__name__)
 
 
 def account_refresh_token(model: AccountModel) -> str:
+    """返回已明确识别为 ChatGPT/Codex 的 RT，而不是微软邮箱 OAuth RT。"""
     extra = model.get_extra()
-    return str(extra.get("refresh_token") or extra.get("refreshToken") or "").strip()
-
+    refresh_token = str(extra.get("refresh_token") or extra.get("refreshToken") or "").strip()
+    if not refresh_token:
+        return ""
+    source = str(extra.get("chatgpt_refresh_token_source") or "").strip().lower()
+    if source in {"codex_oauth", "openai", "chatgpt"}:
+        return refresh_token
+    # 历史 bug：微软邮箱 refresh_token 曾覆盖到标准 RT 字段。检测到微软 OAuth
+    # 凭据且没有 ChatGPT 来源标记时，强制显示为缺 RT 并允许补 RT 修复。
+    is_microsoft = str(extra.get("mail_provider") or extra.get("provider") or "").lower() == "microsoft"
+    if is_microsoft and (extra.get("client_id") or extra.get("mailbox_refresh_token")):
+        return ""
+    return refresh_token
 
 def account_missing_rt(model: AccountModel) -> bool:
     return not account_refresh_token(model)

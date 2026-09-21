@@ -829,7 +829,14 @@ export default function Accounts() {
   const getRefreshToken = (record: any): string => {
     try {
       const extra = JSON.parse(record.extra_json || '{}')
-      return extra.refresh_token || extra.refreshToken || ''
+      const refreshToken = String(extra.refresh_token || extra.refreshToken || '')
+      if (!refreshToken) return ''
+      const source = String(extra.chatgpt_refresh_token_source || '').toLowerCase()
+      if (['codex_oauth', 'openai', 'chatgpt'].includes(source)) return refreshToken
+      // 兼容旧数据：微软邮箱 OAuth 曾错误覆盖到 refresh_token，不能把它展示为 ChatGPT RT。
+      const isMicrosoftMailbox = String(extra.mail_provider || extra.provider || '').toLowerCase() === 'microsoft'
+      if (isMicrosoftMailbox && (extra.client_id || extra.mailbox_refresh_token)) return ''
+      return refreshToken
     } catch {
       return ''
     }

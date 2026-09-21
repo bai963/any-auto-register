@@ -181,6 +181,7 @@ class ChatGPTRegistrationModeAdapter:
         return {
             "access_token": result.access_token,
             "refresh_token": result.refresh_token,
+            "chatgpt_refresh_token_source": "codex_oauth" if result.refresh_token else "",
             "id_token": result.id_token,
             "session_token": result.session_token,
             "cookies": result.cookie_header,

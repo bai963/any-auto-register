@@ -205,20 +205,19 @@ class ChatGPTRegistrationEngine:
         if not isinstance(source, dict):
             return registration
 
+        # 微软邮箱 OAuth 与 ChatGPT/Codex 都使用 refresh_token 这个名字。
+        # 必须给邮箱凭据加命名空间，不能覆盖 ChatGPT 的 RT。
         keys = (
-            "mail_provider",
-            "provider",
-            "account_type",
-            "password",
-            "client_id",
-            "refresh_token",
-            "mailapi_url",
-            "mailbox_token",
+            "mail_provider", "provider", "account_type", "password", "client_id",
+            "mailapi_url", "mailbox_token",
         )
         for key in keys:
             value = source.get(key)
             if value not in (None, "", False):
                 registration.metadata.setdefault(key, value)
+        mailbox_refresh_token = source.get("refresh_token")
+        if mailbox_refresh_token not in (None, "", False):
+            registration.metadata.setdefault("mailbox_refresh_token", mailbox_refresh_token)
 
         # OutlookMailbox 的内部凭据使用 provider=microsoft；补 RT 解析器识别
         # 的是 mail_provider，统一补一份标准字段。

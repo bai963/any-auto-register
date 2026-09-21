@@ -225,7 +225,7 @@ def _build_icloud_provider(address: str, *, log_fn=None, **_kwargs):
     return ICloudAliasMailProvider(alias_id, address, log_fn=log_fn), ""
 
 
-def _build_outlook_provider(address: str, *, config: dict, proxy=None, otp_timeout=None, **_kwargs):
+def _build_outlook_provider(address: str, *, account_extra: dict, config: dict, proxy=None, otp_timeout=None, **_kwargs):
     from sqlmodel import Session
 
     from core.base_mailbox import MailboxAccount, create_mailbox
@@ -240,7 +240,7 @@ def _build_outlook_provider(address: str, *, config: dict, proxy=None, otp_timeo
             "provider": "microsoft",
             "password": row.password or "",
             "client_id": row.client_id or "",
-            "refresh_token": row.refresh_token or "",
+            "refresh_token": str(account_extra.get("mailbox_refresh_token") or row.refresh_token or ""),
             "account_type": row.account_type or "microsoft_oauth",
             "mailapi_url": row.mailapi_url or "",
         }
