@@ -172,7 +172,7 @@ class RefreshTokenBackfiller:
 
     def run(self) -> BackfillResult:
         if not self.email:
-            return BackfillResult(success=False, error_message="账号没有登录标识，无法补 RT")
+            return BackfillResult(success=False, error_message="账号没有邮箱或手机号登录标识，无法补 RT")
 
         result = BackfillResult(success=False, email=self.email)
 

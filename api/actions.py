@@ -88,6 +88,22 @@ def _apply_action_result(
 
             acc_model.updated_at = datetime.now(timezone.utc)
             session.add(acc_model)
+    if platform == "chatgpt" and action_id == "backfill_refresh_token":
+        # 手机号补 RT 绑定成功后，把主账号字符串切换为邮箱；CPA 上传从主字段取
+        # email，若只写 token extra 会继续上传 +E.164 手机号而被 CPA 拒绝。
+        bound_email = str(result.get("account_email_patch") or "").strip()
+        if bound_email:
+            from services.chatgpt_rt_backfill import account_identifier_kind
+            if account_identifier_kind(bound_email) == "email":
+                acc_model.email = bound_email
+                from datetime import datetime, timezone
+                acc_model.updated_at = datetime.now(timezone.utc)
+                session.add(acc_model)
+        events = result.get("mailbox_status_events") or []
+        if events:
+            from core.base_mailbox import apply_mailbox_status_events
+            apply_mailbox_status_events(events)
+
     if isinstance(result.get("account_extra_patch"), dict):
         patch = result["account_extra_patch"]
         extra = acc_model.get_extra()

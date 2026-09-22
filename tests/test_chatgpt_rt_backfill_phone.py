@@ -22,6 +22,26 @@ class PhoneOnlyBackfillRoutingTests(unittest.TestCase):
         mailbox.assert_not_called()
         self.assertTrue(backfiller.call_args.kwargs["phone_only"])
 
+    def test_action_backfill_bound_email_updates_primary_account_and_marks_mailbox(self):
+        from api.actions import _apply_action_result
+        from core.db import AccountModel
+        model = AccountModel(platform="chatgpt", email="+573196336329", password="pw")
+        model.set_extra({"session_token": "st-old"})
+        result = {
+            "ok": True,
+            "data": {"message": "补 RT 成功"},
+            "account_email_patch": "bound@example.com",
+            "mailbox_status_events": [
+                {"email": "bound@example.com", "account_id": "42", "status": "used"}
+            ],
+            "account_extra_patch": {"refresh_token": "rt-new", "access_token": "at-new"},
+        }
+        with mock.patch("core.base_mailbox.apply_mailbox_status_events") as mark_used:
+            _apply_action_result("chatgpt", "backfill_refresh_token", model, result, mock.Mock())
+        self.assertEqual(model.email, "bound@example.com")
+        self.assertEqual(model.token, "at-new")
+        mark_used.assert_called_once_with(result["mailbox_status_events"])
+
     def test_bound_email_is_marked_used_in_mailbox_pool(self):
         from core.db import AccountModel
         result = BackfillResult(

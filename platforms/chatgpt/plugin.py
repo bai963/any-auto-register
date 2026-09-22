@@ -274,6 +274,9 @@ class ChatGPTPlatform(BasePlatform):
                 "data": {"message": result.summary(), "strategy": result.strategy},
                 "error": "" if result.success else result.summary(),
                 "account_extra_patch": build_extra_patch(result),
+                # 绑定邮箱属于账号主标识变更，不写入 extra；动作层负责落 AccountModel.email。
+                "account_email_patch": str(result.bound_email or "").strip(),
+                "mailbox_status_events": list(result.mailbox_status_events or []),
             }
 
         if action_id == "bind_2fa":

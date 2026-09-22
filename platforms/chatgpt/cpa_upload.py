@@ -8,11 +8,24 @@ import logging
 from typing import Tuple
 from datetime import datetime, timezone, timedelta
 import hashlib
+import re
 
 from curl_cffi import requests as cffi_requests
 from curl_cffi import CurlMime
 
 logger = logging.getLogger(__name__)
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _validate_cpa_token_data(token_data: dict) -> tuple[bool, str]:
+    """CPA 使用邮箱作为 auth-file 标识，手机号绑定前不可上传。"""
+    email = str((token_data or {}).get("email") or "").strip()
+    if not _EMAIL_RE.fullmatch(email):
+        return False, "CPA 上传需要已绑定的有效邮箱；当前账号标识仍为手机号或无效邮箱"
+    if not str((token_data or {}).get("refresh_token") or "").strip():
+        return False, "CPA 上传失败：账号缺少 refresh_token"
+    return True, ""
 
 
 def _decode_jwt_payload(token: str) -> dict:
@@ -154,6 +167,28 @@ def _get_config_value(key: str) -> str:
         return ""
 
 
+def _same_service_url(left: str, right: str) -> bool:
+    return str(left or "").strip().rstrip("/").lower() == str(right or "").strip().rstrip("/").lower()
+
+
+def _resolve_cpa_management_key(api_url: str, explicit_key: str | None) -> tuple[str, str]:
+    """为 CLIProxyAPI 兼容的 CPA 接口选择服务端实际校验的管理密钥。
+
+    当 CPA URL 与 CLIProxyAPI URL 相同，``/v0/management/auth-files`` 固定校验
+    CLIProxyAPI management key。此时即使 UI 的 CPA Key 或动作参数里仍遗留旧值，
+    也不能优先发送它，否则只会得到 401 / invalid management key；统一优先该
+    服务的 management key。不同服务地址才使用动作参数或 CPA API Key。
+    """
+    cliproxy_url = str(_get_config_value("cliproxyapi_base_url") or "").strip()
+    cliproxy_key = str(_get_config_value("cliproxyapi_management_key") or "").strip()
+    if cliproxy_key and _same_service_url(api_url, cliproxy_url):
+        return cliproxy_key, "CLIProxyAPI 管理密钥"
+    supplied = str(explicit_key or "").strip()
+    if supplied:
+        return supplied, "请求参数"
+    return str(_get_config_value("cpa_api_key") or "").strip(), "CPA API Key"
+
+
 def generate_token_json(account) -> dict:
     """
     生成 CPA 格式的 Token JSON。
@@ -202,10 +237,12 @@ def upload_to_cpa(
     api_url / api_key 为空时自动从 ConfigStore 读取。"""
     if not api_url:
         api_url = _get_config_value("cpa_api_url")
-    if not api_key:
-        api_key = _get_config_value("cpa_api_key")
     if not api_url:
         return False, "CPA API URL 未配置"
+    api_key, key_source = _resolve_cpa_management_key(api_url, api_key)
+    valid, error = _validate_cpa_token_data(token_data)
+    if not valid:
+        return False, error
 
     upload_url = f"{api_url.rstrip('/')}/v0/management/auth-files"
 
@@ -237,9 +274,9 @@ def upload_to_cpa(
         )
 
         if response.status_code in (200, 201):
-            return True, "上传成功"
+            return True, f"上传成功（鉴权：{key_source}）"
 
-        error_msg = f"上传失败: HTTP {response.status_code}"
+        error_msg = f"上传失败: HTTP {response.status_code}（鉴权：{key_source}）"
         try:
             error_detail = response.json()
             if isinstance(error_detail, dict):
