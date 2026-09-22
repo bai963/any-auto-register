@@ -81,6 +81,7 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "check_plus_trial", "label": "检测 Plus 试用", "params": []},
             {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
+            {"id": "fetch_account_id", "label": "获取 ChatGPT Account ID", "params": []},
             {"id": "backfill_refresh_token", "label": "补 RT", "params": []},
             {"id": "bind_2fa", "label": "绑定 2FA", "params": []},
             {
@@ -211,6 +212,32 @@ class ChatGPTPlatform(BasePlatform):
                     "sync_statuses": {
                         "cliproxyapi": sync_result,
                     },
+                },
+            }
+
+        if action_id == "fetch_account_id":
+            from platforms.chatgpt.account_identity import fetch_chatgpt_account_identity
+
+            identity = fetch_chatgpt_account_identity(
+                session_token=a.session_token,
+                access_token=a.access_token,
+                device_id=str(extra.get("device_id") or ""),
+                proxy=proxy,
+            )
+            found = bool(identity.get("account_id"))
+            return {
+                "ok": found,
+                "data": {
+                    "message": (f"ChatGPT Account ID: {identity['account_id']}" if found else identity.get("message") or "未找到 ChatGPT Account ID"),
+                    **identity,
+                },
+                "error": "" if found else identity.get("message") or "当前会话未返回 ChatGPT Account ID",
+                "account_extra_patch": {
+                    "chatgpt_account_id": identity["account_id"],
+                    "chatgpt_account_user_id": identity.get("account_user_id", ""),
+                    "chatgpt_user_id": identity.get("user_id", ""),
+                    "workspace_id": identity.get("workspace_id", ""),
+                    "chatgpt_identity_source": identity.get("source", ""),
                 },
             }
 

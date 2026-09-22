@@ -790,7 +790,7 @@ class AuthFlow(PhoneRegisterMixin):
         )
         return True
 
-    def _codex_drive_login_from_log_in(self, mail_provider: Optional[MailProvider] = None) -> str:
+    def _codex_drive_login_from_log_in(self, mail_provider: Optional[MailProvider] = None, email_bind_provider_factory=None, login_identifier_kind: str = "email") -> str:
         """
         当 Codex 授权回落到 /log-in 时，补走一次纯协议登录推进状态机。
         返回可继续跟随的 continue_url（若无则返回空字符串）。
@@ -812,12 +812,14 @@ class AuthFlow(PhoneRegisterMixin):
             self.result.device_id = device_id
 
         sentinel = self.get_sentinel_token(device_id)
+        identifier_kind = "phone_number" if login_identifier_kind == "phone_number" else "email"
         step = self.authorize_continue(
             email=email,
             sentinel_token=sentinel,
             screen_hint="login",
             referer="https://auth.openai.com/log-in",
             trace_step="authorize_continue_login_codex",
+            username_kind=identifier_kind,
         )
         page_type = self._extract_page_type(step)
         continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
@@ -853,6 +855,20 @@ class AuthFlow(PhoneRegisterMixin):
             logger.info(f"提交 TOTP 码进行 2FA 验证（challenge_id={challenge_id[:16]}...）")
             mfa_resp = self.submit_mfa_totp(totp_code, challenge_id)
             continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(mfa_resp))
+
+        # 只有 Codex 当前授权链明确给出 add-email 时，才允许单手机号账号领取邮箱。
+        # 普通已登录会话不能猜测调用 add-email/send，否则会 invalid_auth_step。
+        if self._is_add_email_state(page_type=page_type, continue_url=continue_url):
+            if callable(email_bind_provider_factory):
+                provider = email_bind_provider_factory()
+                continue_url = self._try_bind_email(
+                    provider, continue_url, mail_provider_factory=email_bind_provider_factory
+                )
+                if self.result.bound_email:
+                    self.result.email = self.result.bound_email
+                    logger.info("Codex 补 RT 链路已顺带绑定邮箱: %s", self.result.bound_email)
+            else:
+                logger.info("Codex 授权链提供 add-email，但当前账号没有可用邮箱池工厂，跳过绑定")
 
         need_otp = (page_type == "email_otp_verification") or ("/email-verification" in (continue_url or ""))
         if need_otp:
@@ -974,6 +990,9 @@ class AuthFlow(PhoneRegisterMixin):
 
         deadline = time.time() + max(20, int(timeout))
         while time.time() < deadline:
+            control = getattr(self, "_task_control", None)
+            if control is not None:
+                control.checkpoint(attempt_id=getattr(self, "_task_attempt_token", None))
             code = self._read_phone_otp_from_cmd()
             if code:
                 return code
@@ -1374,7 +1393,7 @@ class AuthFlow(PhoneRegisterMixin):
         logger.info("Codex RT 验证成功: refresh=%s", "已轮换" if rotated else "可用")
         return True
 
-    def oauth_codex_rt_exchange(self, mail_provider: Optional[MailProvider] = None) -> bool:
+    def oauth_codex_rt_exchange(self, mail_provider: Optional[MailProvider] = None, email_bind_provider_factory=None, login_identifier_kind: str = "email") -> bool:
         """
         纯协议方式获取 RT（参考 any-auto-register）：
         - 使用独立 Codex OAuth 参数重新授权（可控 PKCE）
@@ -1403,7 +1422,7 @@ class AuthFlow(PhoneRegisterMixin):
                 logger.info("Codex 授权回落到 /log-in，尝试协议推进登录状态...")
                 continue_url = ""
                 try:
-                    continue_url = self._codex_drive_login_from_log_in(mail_provider=mail_provider)
+                    continue_url = self._codex_drive_login_from_log_in(mail_provider=mail_provider, email_bind_provider_factory=email_bind_provider_factory, login_identifier_kind=login_identifier_kind)
                 except Exception as e:
                     logger.warning(f"Codex 登录推进失败，改走 no-prompt 兜底: {e}")
                 if continue_url:
@@ -3444,6 +3463,91 @@ class AuthFlow(PhoneRegisterMixin):
             raise RuntimeError("协议登录完成，但未拿到有效 session/access token")
 
         logger.info("纯协议登录流程完成")
+        return self.result
+
+    def run_protocol_phone_login(
+        self, phone_number: str, password: str = "", *, email_bind_provider_factory=None
+    ) -> AuthResult:
+        """已注册的单手机号账号登录并补 RT。
+
+        与 ``run_protocol_login`` 不同，身份提交明确使用 ``phone_number``。仅在
+        OpenAI 当前授权状态明确落入 add-email 时才领取邮箱；不会把手机号传给
+        邮箱 OTP 或邮箱登录接口。
+        """
+        phone = (phone_number or "").strip()
+        if not phone.startswith("+"):
+            raise RuntimeError("手机号协议登录需要 E.164 格式手机号")
+        if not self.check_proxy():
+            logger.warning("网络预检查未通过，继续尝试手机号登录以获取精确错误...")
+        if not self.warmup():
+            raise RuntimeError("warmup 失败，无法建立手机号登录所需会话")
+
+        self.result.email = phone
+        self.result.phone_number = phone
+        login_password = (password or "").strip()
+        if login_password:
+            self.result.password = login_password
+        else:
+            login_password, known = self._resolve_login_password(phone)
+            if known:
+                self.result.password = login_password
+
+        csrf = self.get_csrf_token()
+        auth_url = self.get_auth_url(csrf, login_hint=phone)
+        device_id = self.auth_oauth_init(auth_url)
+        sentinel = self.get_sentinel_token(device_id)
+        step = self.authorize_continue(
+            email=phone, sentinel_token=sentinel, screen_hint="login",
+            referer="https://auth.openai.com/log-in?usernameKind=phone_number",
+            trace_step="authorize_continue_phone_login", username_kind="phone_number",
+        )
+        page_type = self._extract_page_type(step)
+        continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
+        if page_type == "login_password" or "/log-in/password" in continue_url:
+            step = self.login_password_verify(login_password)
+            page_type = self._extract_page_type(step)
+            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
+
+        if self._is_mfa_challenge_state(page_type, continue_url):
+            secret = (self.result.totp_secret or "").strip()
+            if not secret and self._account_callback:
+                credentials = self._account_callback(phone) or {}
+                secret = str(credentials.get("totp_secret") or "").strip()
+                self.result.totp_secret = secret
+            if not secret:
+                raise RuntimeError("手机号登录需要 TOTP，但账号没有 totp_secret")
+            challenge_id = continue_url.split("/")[-1] if "/mfa-challenge/" in continue_url else ""
+            if not challenge_id:
+                raise RuntimeError("手机号登录无法获取 MFA challenge_id")
+            step = self.submit_mfa_totp(_totp_now(secret), challenge_id)
+            page_type = self._extract_page_type(step)
+            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
+
+        # 个别账号会要求再次验证手机号。只使用已配置的官方短信回调/用户 OTP，
+        # 不租用或替换账号原手机号。
+        if self._is_phone_otp_send_state(page_type, continue_url):
+            step = self.send_phone_otp(phone, continue_url)
+            page_type = self._extract_page_type(step)
+            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
+        if self._is_phone_otp_state(page_type, continue_url):
+            code = self._wait_phone_otp(timeout=max(10, int(self._get_env("OPENAI_PHONE_OTP_TIMEOUT", "180"))))
+            step = self._phone_otp_validate(code, referer=PHONE_VERIFICATION_REFERER)
+            continue_url = self._normalize_continue_url(self._extract_continue_url_from_step(step))
+
+        if self._is_add_email_state(continue_url=continue_url):
+            if not callable(email_bind_provider_factory):
+                raise RuntimeError("手机号登录要求绑定邮箱，但未配置可用邮箱池")
+            provider = email_bind_provider_factory()
+            continue_url = self._try_bind_email(provider, continue_url, email_bind_provider_factory)
+            if not self.result.bound_email:
+                raise RuntimeError(getattr(self, "_bind_email_error", "") or "绑定邮箱未完成")
+            self.result.email = self.result.bound_email
+
+        # 登录态已经推进完成；使用同一会话的 Codex OAuth 取得 RT。
+        self.oauth_codex_rt_exchange(
+            mail_provider=None, email_bind_provider_factory=email_bind_provider_factory,
+            login_identifier_kind="phone_number",
+        )
         return self.result
 
     # ── 从已有凭证初始化 ──

@@ -12,7 +12,8 @@ Codex 交换失败被 ``registration_engine._salvage`` 抢救回来的（凭证�
 
     ② 协议重登：会话过期时才走。邮箱 + 密码重新跑一遍 ``run_protocol_login``，
        开 ``OAUTH_REFRESH_ONLY`` 只要 RT 不折腾多余的 session 请求。这条路
-       可能撞上邮箱 OTP —— 收不到码就明确报错，不要装作成功。
+       可能撞上邮箱 OTP —— 收不到码就明确报错，不要装作成功。若 Codex 授权链
+       明确下发 add-email 状态，才会安全领取邮箱并顺带绑定。
 
 协议层不认识本仓库的库表，邮箱与接码都由调用方以注入点形式传进来。
 """
@@ -20,6 +21,7 @@ Codex 交换失败被 ``registration_engine._salvage`` 抢救回来的（凭证�
 from __future__ import annotations
 
 import logging
+import inspect
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -31,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 STRATEGY_SESSION = "session"
 STRATEGY_LOGIN = "login"
+STRATEGY_PHONE_LOGIN = "phone_login"
 
 # 两条路共用的协议开关：只为拿 RT，别的一律省掉。
 # OAUTH_CODEX_RT_ALLOW_RETRY 打开是因为补 RT 场景下一轮里可能要试两次
@@ -118,11 +121,12 @@ class BackfillResult:
     refresh_token_verified: bool = False
     refresh_token_verify_error: str = ""
     attempts: list[BackfillAttempt] = field(default_factory=list)
+    bound_email: str = ""
+    mailbox_status_events: list[dict] = field(default_factory=list)
 
     def summary(self) -> str:
         if self.success:
-            label = "复用会话" if self.strategy == STRATEGY_SESSION else "协议重登"
-            return f"补 RT 成功（{label}，已验证）"
+            return f"补 RT 成功（{ {STRATEGY_SESSION: '复用会话', STRATEGY_LOGIN: '邮箱协议重登', STRATEGY_PHONE_LOGIN: '手机号协议重登'}.get(self.strategy, self.strategy) }，已验证）"
         return self.error_message or "补 RT 失败"
 
 
@@ -143,6 +147,7 @@ class RefreshTokenBackfiller:
         mail_provider: Optional[MailProvider] = None,
         mail_unavailable_reason: str = "",
         allow_login: bool = True,
+        phone_only: bool = False,
         log_fn: Optional[Callable[[str], None]] = None,
     ):
         self.email = (email or "").strip()
@@ -156,6 +161,8 @@ class RefreshTokenBackfiller:
         self.mail_provider = mail_provider
         self.mail_unavailable_reason = mail_unavailable_reason
         self.allow_login = allow_login
+        # phone_only 只允许手机号身份登录；不得落入邮箱协议。
+        self.phone_only = bool(phone_only)
         self._log_fn = log_fn
         self.log = log_fn or logger.info
         # 当前正在跑的 flow，报错后还要从它身上把已到手的凭证捞回来
@@ -165,14 +172,15 @@ class RefreshTokenBackfiller:
 
     def run(self) -> BackfillResult:
         if not self.email:
-            return BackfillResult(success=False, error_message="账号没有邮箱，无法补 RT")
+            return BackfillResult(success=False, error_message="账号没有登录标识，无法补 RT")
 
         result = BackfillResult(success=False, email=self.email)
 
-        for strategy, runner in (
-            (STRATEGY_SESSION, self._try_session),
-            (STRATEGY_LOGIN, self._try_login),
-        ):
+        strategies = [(STRATEGY_SESSION, self._try_session)]
+        # 邮箱账号保持原有邮箱补 RT；只有明确的 PHONE_ONLY 才走手机号登录。
+        strategies.append((STRATEGY_PHONE_LOGIN, self._try_phone_login) if self.phone_only
+                          else (STRATEGY_LOGIN, self._try_login))
+        for strategy, runner in strategies:
             skip_reason = self._skip_reason(strategy)
             if skip_reason:
                 result.attempts.append(BackfillAttempt(strategy, False, skip_reason))
@@ -232,21 +240,54 @@ class RefreshTokenBackfiller:
         flow = self._build_flow(_SESSION_OVERRIDES)
         self._active_flow = flow
         flow.from_existing_credentials(self.session_token, self.access_token, self.device_id)
+        # from_existing_credentials 只能从 session profile 猜邮箱；手机号账号必须
+        # 保留原始登录标识，供 Codex 回落 /log-in 后按 phone_number 提交。
+        if not flow.result.email:
+            flow.result.email = self.email
         if not (flow.result.access_token or flow.result.session_token):
             raise RuntimeError("库里的 session/access token 已失效")
         # 授权链被打回 /log-in 时协议层会自己补一次登录，届时可能要邮箱验证码
-        flow.oauth_codex_rt_exchange(mail_provider=self.mail_provider)
+        exchange = flow.oauth_codex_rt_exchange
+        try:
+            accepts_factory = "email_bind_provider_factory" in inspect.signature(exchange).parameters
+        except (TypeError, ValueError):
+            accepts_factory = False
+        kwargs = {"mail_provider": self.mail_provider,
+                  "login_identifier_kind": "phone_number" if self.phone_only else "email"}
+        if accepts_factory:
+            kwargs["email_bind_provider_factory"] = self._build_email_bind_provider
+        try:
+            exchange(**kwargs)
+        except TypeError as exc:
+            # 兼容旧测试/插件替身，它们可能尚未声明新增的 identifier 参数。
+            if "login_identifier_kind" not in str(exc):
+                raise
+            kwargs.pop("login_identifier_kind", None)
+            exchange(**kwargs)
 
     # ── 策略二：协议重新登录 ──
 
     def _try_login(self) -> None:
-        self.log(f"[补RT] 会话不可用，改走协议重登: {self.email}")
+        self.log(f"[补RT] 会话不可用，改走邮箱协议重登: {self.email}")
         flow = self._build_flow(_LOGIN_OVERRIDES)
         self._active_flow = flow
         provider = self.mail_provider or MailboxUnavailableProvider(
             self.email, self.mail_unavailable_reason
         )
         flow.run_protocol_login(provider, self.email, self.password)
+        # run_protocol_login 的主链当前没有 add-email 注入点；若将来协议层在登录后
+        # 暴露该状态，仍只允许由显式状态机调用本工厂，不能在这里猜测 add-email/send。
+
+
+    def _try_phone_login(self) -> None:
+        """单手机号账号的兜底：以 phone_number 身份登录，绝不调用邮箱登录。"""
+        self.log(f"[补RT] 会话复用未取得 RT，改走手机号协议登录: {self.email}")
+        flow = self._build_flow(_LOGIN_OVERRIDES)
+        self._active_flow = flow
+        flow.run_protocol_phone_login(
+            self.email, self.password,
+            email_bind_provider_factory=self._build_email_bind_provider,
+        )
 
     # ── 组装 ──
 
@@ -264,6 +305,24 @@ class RefreshTokenBackfiller:
     def _account_callback(self, email: str) -> dict:
         """协议层撞上 mfa-challenge 时来要 2FA 密钥。"""
         return {"password": self.password, "totp_secret": self.totp_secret}
+
+    def _build_email_bind_provider(self):
+        """仅供 OAuth 链明确落到 add-email 时调用，工厂本身不提前领取邮箱。"""
+        from core.base_mailbox import create_mailbox
+        from platforms.chatgpt.protocol.mailbox_adapter import MailboxProviderAdapter
+
+        mailbox = create_mailbox(
+            provider=self.extra_config.get("mail_provider", "luckmail"),
+            extra=self.extra_config,
+            proxy=self.proxy,
+        )
+        return MailboxProviderAdapter(
+            mailbox,
+            kind=str(self.extra_config.get("mail_provider") or "mailbox"),
+            pooled=True,
+            ephemeral=True,
+            otp_timeout=self._otp_timeout(),
+        )
 
     def _build_sms_callback(self):
         """Codex 授权链可能被打到 add-phone，配了接码就顺手过掉。"""
@@ -305,9 +364,9 @@ class RefreshTokenBackfiller:
     def _skip_reason(self, strategy: str) -> str:
         if strategy == STRATEGY_SESSION and not (self.session_token or self.access_token):
             return "库里没有 session_token / access_token，跳过会话复用"
-        if strategy == STRATEGY_LOGIN:
+        if strategy in (STRATEGY_LOGIN, STRATEGY_PHONE_LOGIN):
             if not self.allow_login:
-                return "已关闭协议重登"
+                return "已关闭手机号协议重登" if strategy == STRATEGY_PHONE_LOGIN else "已关闭协议重登"
             if not self.password:
                 return "库里没有密码，无法协议重登"
         return ""
@@ -334,6 +393,18 @@ class RefreshTokenBackfiller:
         才拿到 RT），谁先跑到的不该被后面的空值抹掉。
         """
         auth = flow.result
+        bound_email = str(getattr(auth, "bound_email", "") or "").strip()
+        if bound_email:
+            result.bound_email = bound_email
+        for provider in getattr(flow, "_email_bind_providers", []) or []:
+            account = getattr(provider, "account", None)
+            if account is None:
+                continue
+            result.mailbox_status_events.append({
+                "email": str(getattr(account, "email", "") or ""),
+                "account_id": str(getattr(account, "account_id", "") or ""),
+                "status": "used" if getattr(provider, "_email_bind_status", "") == "used" else "failed",
+            })
         for attr in ("refresh_token", "access_token", "session_token", "id_token", "cookie_header"):
             value = str(getattr(auth, attr, "") or "").strip()
             if value:
@@ -349,7 +420,7 @@ class RefreshTokenBackfiller:
 
     @staticmethod
     def _label(strategy: str) -> str:
-        return "复用会话" if strategy == STRATEGY_SESSION else "协议重登"
+        return {STRATEGY_SESSION: "复用会话", STRATEGY_LOGIN: "邮箱协议重登", STRATEGY_PHONE_LOGIN: "手机号协议重登"}.get(strategy, strategy)
 
 
 def backfill_refresh_token(**kwargs) -> BackfillResult:

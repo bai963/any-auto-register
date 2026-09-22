@@ -71,6 +71,7 @@ CLAUDE.md
 # 运行时 / 缓存
 __pycache__/
 .pytest_cache/
+pytest-cache*
 .mypy_cache/
 .ruff_cache/
 .coverage

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
@@ -19,6 +20,22 @@ from platforms.chatgpt.rt_backfill import BackfillResult, RefreshTokenBackfiller
 from services.chatgpt_account_selection import select_chatgpt_accounts
 
 logger = logging.getLogger(__name__)
+
+# 账号表历史上会把单手机号放在 ``email`` 列。补 RT 前先按登录标识本身分流，
+# 只接受 E.164，避免
+# 将任意包含数字的字符串误判为手机号；其余值仍按邮箱路径处理以保持兼容。
+_E164_ACCOUNT_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+_EMAIL_ACCOUNT_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def account_identifier_kind(value: str) -> str:
+    """返回 ``phone``、``email`` 或 ``unknown``，用于补 RT 策略分流。"""
+    identifier = str(value or "").strip()
+    if _E164_ACCOUNT_RE.fullmatch(identifier):
+        return "phone"
+    if _EMAIL_ACCOUNT_RE.fullmatch(identifier):
+        return "email"
+    return "unknown"
 
 
 def account_refresh_token(model: AccountModel) -> str:
@@ -94,20 +111,26 @@ def backfill_account_data(
     config = dict(config or _load_config())
     log = log_fn or logger.info
 
-    mail_provider, mail_reason = resolve_otp_mail_provider(
-        email,
-        account_extra=extra,
-        config=config,
-        proxy=proxy,
-        log_fn=log,
-        task_control=task_control,
-        attempt_id=attempt_id,
-    )
-    if mail_provider is None:
-        if allow_login:
-            log(f"[补RT] {email} 暂时读不到收件箱（{mail_reason}），需要邮箱验证码时会失败")
+    identifier_kind = account_identifier_kind(email)
+    # 按账号字符串分流：E.164 走手机号登录，邮箱格式保留邮箱补 RT。
+    is_phone_only = identifier_kind == "phone"
+    if is_phone_only:
+        mail_provider, mail_reason = None, "账号字符串为手机号，跳过邮箱收件通道"
+        log(f"[补RT] {email} 识别为手机号账号，跳过邮箱收件通道；直连失败后将尝试手机号登录")
     else:
-        log(f"[补RT] 收件通道: {getattr(mail_provider, 'display_name', '邮箱')} → {email}")
+        if identifier_kind == "email":
+            log(f"[补RT] {email} 识别为邮箱账号，保留邮箱补 RT 流程")
+        else:
+            log(f"[补RT] {email} 无法确认邮箱/手机号格式，按兼容策略保留邮箱补 RT 流程")
+        mail_provider, mail_reason = resolve_otp_mail_provider(
+            email, account_extra=extra, config=config, proxy=proxy, log_fn=log,
+            task_control=task_control, attempt_id=attempt_id,
+        )
+        if mail_provider is None:
+            if allow_login:
+                log(f"[补RT] {email} 暂时读不到收件箱（{mail_reason}），需要邮箱验证码时会失败")
+        else:
+            log(f"[补RT] 收件通道: {getattr(mail_provider, 'display_name', '邮箱')} → {email}")
 
     return RefreshTokenBackfiller(
         email=email,
@@ -121,6 +144,7 @@ def backfill_account_data(
         mail_provider=mail_provider,
         mail_unavailable_reason=mail_reason,
         allow_login=allow_login,
+        phone_only=is_phone_only,
         log_fn=log,
     ).run()
 
@@ -176,6 +200,10 @@ def apply_backfill_result(
     extra = model.get_extra()
     extra.update(patch)
     model.set_extra(extra)
+    # 绑定成功后只更新账号字符串本身。下次补 RT 会按新的邮箱字符串分流，
+    # 不写 phone_number / register_flow / bound_email 等数据库分类字段。
+    if result.bound_email:
+        model.email = result.bound_email
     if patch.get("access_token"):
         model.token = patch["access_token"]
     model.updated_at = datetime.now(timezone.utc)
@@ -183,6 +211,13 @@ def apply_backfill_result(
         session.add(model)
         if commit:
             session.commit()
+
+    # 手机号登录要求绑定邮箱时，绑定流程会把实际领取的邮箱作为 ``used``
+    # 事件带回。必须在父进程回写邮箱池，避免该邮箱再次被分配；失败邮箱仍由
+    # 引擎以 failed 事件处理。这里集中处理，也覆盖非 tasks API 的调用方。
+    if result.mailbox_status_events:
+        from core.base_mailbox import apply_mailbox_status_events
+        apply_mailbox_status_events(result.mailbox_status_events)
     return patch
 
 

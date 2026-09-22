@@ -1,18 +1,6 @@
 # Any Auto Register
 
-<p align="center">
-  <a href="https://linux.do" target="_blank">
-    <img src="https://img.shields.io/badge/LINUX-DO-FFB003?style=for-the-badge&logo=linux&logoColor=white" alt="LINUX DO" />
-  </a>
-</p>
-
 > ⚠️ 免责声明：本项目仅供学习与研究使用，不得用于任何商业用途。使用本项目所产生的一切后果由使用者自行承担。
-
-<p align="center">
-  <a href="README.md">中文</a> |
-  <a href="README_en.md">English</a> |
-  <a href="README_vi.md">Tiếng Việt</a>
-</p>
 
 多平台账号自动注册与管理系统，支持插件化扩展、Web UI 管理、批量注册、状态同步，以及本地 Turnstile Solver 自动拉起。
 
@@ -59,23 +47,6 @@
 - **实时日志**：前端实时查看注册日志
 - **任务历史管理**：支持历史记录查看与批量删除
 - **插件化扩展**：可按需接入外部服务和独立管理端
-
-## 自营产品
-
-感谢以下自营产品对 any-auto-register 的支持。
-
-| Logo | 名称 | 介绍 | 官网 |
-| --- | --- | --- | --- |
-| <a href="https://faka.gsyun.cloud/" target="_blank"><img src="frontend/public/logo.png" alt="阿晨小铺" width="140" /></a> | 阿晨小铺 | 本人经营gpt等虚拟产品,诚信稳定，有保障 | [https://faka.gsyun.cloud/](https://faka.gsyun.cloud/) |
-| <a href="https://api.codelife.eu.cc/" target="_blank">zc-api</a> | zc-api | 面向 Claude Code、Codex 等模型调用场景的中转服务，10G 带宽保障首字响应更快、链路稳定。提供高可用接口、便捷接入与持续交付支持，适合开发者与团队长期使用；支持开具发票，详情可前往官网查看。 | [https://api.codelife.eu.cc/](https://api.codelife.eu.cc/) |
-
-## 赞助商目录
-
-感谢以下朋友与伙伴对 any-auto-register 的支持。
-
-| Logo | 名称 | 介绍 | 官网 |
-| --- | --- | --- | --- |
-| <a href="https://www.ipwo.net/?ref=githubanyautoregister" target="_blank"><img src="frontend/public/ipwo.png" alt="IPWO" width="140" /></a> | IPWO | IPWO 住宅代理适用于浏览器自动化、多地区网络访问、数据采集及在线业务测试等场景。<br><br>对于 any-auto-register 这类涉及浏览器自动化、代理池管理和多环境运行的项目，IPWO 住宅代理可用于配置不同浏览器会话的网络环境，支持灵活的 IP 切换与地区选择，为自动化任务提供更加便捷的代理接入方式。<br><br>提供 195+ 地区动静态 IP 资源，支持 http/https/socks5 协议，免费测试。<br><br>**专属优惠码：0204（优惠 10%）** | [https://www.ipwo.net/?ref=githubanyautoregister](https://www.ipwo.net/?ref=githubanyautoregister) |
 
 ## 界面预览
 
@@ -642,16 +613,6 @@ Electron 开发模式不会自动启动 Python 后端。
 ```
 
 然后再运行 Electron。
-
-## 用户讨论群
-
-- QQ群：**1065114376**（any-auto-register 注册机用户讨论群）
-
-## 赞助支持
-
-如果这个项目对你有帮助，欢迎赞助支持项目继续维护与更新。
-
-![打赏码](docs/images/dashang.JPG)
 
 ## Star History
 

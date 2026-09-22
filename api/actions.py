@@ -71,6 +71,14 @@ def _apply_action_result(
     if platform == "chatgpt":
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
         status_reason = ""
+        if action_id == "fetch_account_id":
+            # Account ID 是 ChatGPT 侧稳定账号标识；同步到主列，便于单手机号账号复制使用。
+            account_id = str(data.get("account_id") or "").strip()
+            if account_id:
+                acc_model.user_id = account_id
+                from datetime import datetime, timezone
+                acc_model.updated_at = datetime.now(timezone.utc)
+                session.add(acc_model)
         if action_id == "probe_local_status":
             status_reason = apply_chatgpt_status_policy(acc_model, local_probe=data.get("probe"))
         elif action_id == "sync_cliproxyapi_status":

@@ -53,7 +53,27 @@ TASK_STALL_DIAGNOSIS_SECONDS = 120
 # 邮箱绑定余量，普通流程也不允许无限占住 40/200 worker 槽位。
 REGISTER_ATTEMPT_TIMEOUT_SECONDS = 300
 PHONE_REGISTER_ATTEMPT_TIMEOUT_SECONDS = 360
+# phone_with_email 没有父级 attempt deadline；子进程卡死时仍要定期回收已经超过
+# 本地四分钟窗口的 activation，不能等接码平台自己的约二十分钟自然过期。
+_SMS_EXPIRED_ACTIVATION_REAP_INTERVAL_SECONDS = 10
+_sms_expired_activation_reap_lock = threading.Lock()
+_sms_expired_activation_last_reap_at = 0.0
 
+
+def _reap_expired_sms_activations(config: dict, *, proxy: Optional[str] = None) -> int:
+    """定期回收已超本地等待窗口的接码 activation。"""
+    global _sms_expired_activation_last_reap_at
+    now = time.monotonic()
+    with _sms_expired_activation_reap_lock:
+        if now - _sms_expired_activation_last_reap_at < _SMS_EXPIRED_ACTIVATION_REAP_INTERVAL_SECONDS:
+            return 0
+        _sms_expired_activation_last_reap_at = now
+    try:
+        from services.sms_service import cancel_expired_sms_activations
+        return cancel_expired_sms_activations(config, proxy=proxy)
+    except Exception:
+        logger.warning("扫描超时接码 activation 失败", exc_info=True)
+        return 0
 
 def _should_run_register_in_child_process() -> bool:
     """生产请求隔离不可信协议 I/O；pytest 内需保留同一解释器的 mock/计数器。
@@ -162,6 +182,20 @@ class BackfillRtTaskRequest(BaseModel):
     delay_seconds: float = Field(default=5, ge=0)
     # 补 RT 的协议链若遇到 add-phone，单个账号最多可新租的号码数；0 = 不租号。
     sms_max_phone_attempts: int = Field(default=3, ge=0, le=20)
+    proxy: Optional[str] = None
+
+
+class BackfillAccountIdTaskRequest(BaseModel):
+    """批量补 ChatGPT Account ID；只使用已有 session，不触发重登或 OTP。"""
+
+    account_ids: list[int] = Field(default_factory=list)
+    all_filtered: bool = False
+    email: str = ""
+    status: str = ""
+    plus_status: str = ""
+    only_missing_account_id: bool = True
+    concurrency: int = Field(default=1, ge=1, le=MAX_TASK_CONCURRENCY)
+    delay_seconds: float = Field(default=3, ge=0)
     proxy: Optional[str] = None
 
 
@@ -773,9 +807,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         kind, value = child_queue.get(timeout=1.0)
                     except queue.Empty:
                         _heartbeat(attempt_id, "child_register")
+                        # phone_with_email 没有整轮 deadline，仍须由父进程持续回收
+                        # 已超过四分钟的 activation；否则子进程卡住时号码会在供应商
+                        # 侧一直挂到约二十分钟自然过期。
+                        cancelled = _reap_expired_sms_activations(merged_extra, proxy=_proxy)
+                        if cancelled:
+                            _log(task_id, f"[接码] 已取消超时未收码号码 {cancelled} 个")
                         if deadline is not None and time.monotonic() >= deadline:
-                            from services.sms_service import cancel_expired_sms_activations
-                            cancelled = cancel_expired_sms_activations(merged_extra, proxy=_proxy)
                             child.terminate()
                             child.join(timeout=10)
                             raise TimeoutError(
@@ -1275,6 +1313,8 @@ def _run_backfill_rt(task_id: str, account_ids: list[int], req: BackfillRtTaskRe
                 apply_backfill_result(account, result, session=s, commit=True)
 
         if result.success:
+            if result.bound_email:
+                _log(task_id, f"  [绑定邮箱] {email} → {result.bound_email}")
             _log(task_id, f"[OK] {email} {result.summary()}")
             _save_task_log("chatgpt", email, "success", detail={"action": "backfill_rt"})
             return AttemptResult.success()
@@ -1300,6 +1340,52 @@ def _run_backfill_rt(task_id: str, account_ids: list[int], req: BackfillRtTaskRe
         proxy=req.proxy,
         handle_account=_handle,
     )
+
+
+def _run_backfill_account_id(task_id: str, account_ids: list[int], req: BackfillAccountIdTaskRequest):
+    """按补 RT 同一任务骨架批量查询 ChatGPT Account ID。"""
+    from core.db import AccountModel
+    from platforms.chatgpt.account_identity import fetch_chatgpt_account_identity
+
+    def _handle(*, account_id, fields, proxy, control, attempt_id) -> AttemptResult:
+        email = fields["email"]
+        extra = dict(fields["extra"] or {})
+        identity = fetch_chatgpt_account_identity(
+            session_token=str(extra.get("session_token") or ""),
+            access_token=str(extra.get("access_token") or fields["token"] or ""),
+            device_id=str(extra.get("device_id") or ""), proxy=proxy,
+        )
+        account_value = str(identity.get("account_id") or "").strip()
+        with Session(engine) as s:
+            account = s.get(AccountModel, account_id)
+            if account is not None:
+                current = account.get_extra()
+                current.update({
+                    "chatgpt_account_user_id": identity.get("account_user_id") or current.get("chatgpt_account_user_id", ""),
+                    "chatgpt_user_id": identity.get("user_id") or current.get("chatgpt_user_id", ""),
+                    "workspace_id": identity.get("workspace_id") or current.get("workspace_id", ""),
+                    "chatgpt_identity_source": identity.get("source", ""),
+                    "chatgpt_identity_last_error": "" if account_value else identity.get("message", ""),
+                })
+                if account_value:
+                    current["chatgpt_account_id"] = account_value
+                    account.user_id = account_value
+                account.set_extra(current)
+                session_now = datetime.now(timezone.utc)
+                account.updated_at = session_now
+                s.add(account)
+                s.commit()
+        if account_value:
+            _log(task_id, f"[OK] {email} ChatGPT Account ID: {account_value}（来源: {identity.get('source') or 'unknown'}）")
+            _save_task_log("chatgpt", email, "success", detail={"action": "backfill_account_id", "account_id": account_value})
+            return AttemptResult.success()
+        message = str(identity.get("message") or "当前会话未返回 ChatGPT Account ID")
+        _log(task_id, f"[SKIP] {email} {message}")
+        return AttemptResult.skipped(f"{email}: {message}")
+
+    _handle.uses_mail = False
+    _run_account_batch_task(task_id, account_ids, label="补 ChatGPT Account ID", concurrency=req.concurrency,
+                            delay_seconds=req.delay_seconds, proxy=req.proxy, handle_account=_handle)
 
 
 def _run_bind_2fa(task_id: str, account_ids: list[int], req: Bind2faTaskRequest):
@@ -1416,6 +1502,39 @@ def create_backfill_rt_task(req: BackfillRtTaskRequest, background_tasks: Backgr
     if missing_ids:
         _log(task_id, f"忽略不存在的账号: {missing_ids}")
     background_tasks.add_task(_run_backfill_rt, task_id, account_ids, req)
+    return {"task_id": task_id, "total": len(account_ids), "missing_ids": missing_ids}
+
+
+@router.post("/backfill-account-id")
+def create_backfill_account_id_task(req: BackfillAccountIdTaskRequest, background_tasks: BackgroundTasks):
+    """批量补缺失的 ChatGPT Account ID。"""
+    from services.chatgpt_account_selection import select_chatgpt_accounts
+
+    _validate_task_concurrency(req.concurrency)
+    def _missing(model):
+        return not str(model.get_extra().get("chatgpt_account_id") or model.user_id or "").strip()
+    with Session(engine) as s:
+        try:
+            accounts, missing_ids = select_chatgpt_accounts(
+                s, account_ids=req.account_ids, all_filtered=req.all_filtered, email=req.email,
+                status=req.status, plus_status=req.plus_status,
+                keep=_missing if req.only_missing_account_id else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        account_ids = [int(row.id) for row in accounts if row.id]
+    if not account_ids:
+        raise HTTPException(400, "没有符合条件的缺 ChatGPT Account ID 账号")
+    task_id = f"backfill_account_id_{int(time.time() * 1000)}"
+    _task_store.create(task_id, platform="chatgpt", total=len(account_ids), source="backfill_account_id", meta={
+        "kind": "backfill_account_id", "only_missing_account_id": req.only_missing_account_id,
+        "concurrency": req.concurrency, "delay_seconds": req.delay_seconds, "missing_ids": missing_ids,
+    })
+    _persist_task_snapshot(task_id)
+    _log(task_id, f"待补 ChatGPT Account ID 账号 {len(account_ids)} 个（仅使用现有会话，不会重登或请求验证码）")
+    if missing_ids:
+        _log(task_id, f"忽略不存在的账号: {missing_ids}")
+    background_tasks.add_task(_run_backfill_account_id, task_id, account_ids, req)
     return {"task_id": task_id, "total": len(account_ids), "missing_ids": missing_ids}
 
 

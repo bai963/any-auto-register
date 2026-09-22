@@ -797,6 +797,10 @@ export default function Accounts() {
   const [backfillRtLoading, setBackfillRtLoading] = useState(false)
   const [backfillRtTaskId, setBackfillRtTaskId] = useState<string | null>(null)
   const [backfillRtForm] = Form.useForm()
+  const [backfillAccountIdModalOpen, setBackfillAccountIdModalOpen] = useState(false)
+  const [backfillAccountIdLoading, setBackfillAccountIdLoading] = useState(false)
+  const [backfillAccountIdTaskId, setBackfillAccountIdTaskId] = useState<string | null>(null)
+  const [backfillAccountIdForm] = Form.useForm()
 
   useEffect(() => {
     setCurrentPlatform(phoneOnlyPage ? 'chatgpt' : (platform || 'chatgpt'))
@@ -1212,6 +1216,38 @@ export default function Accounts() {
     backfillRtForm.resetFields()
   }
 
+  const handleBackfillAccountId = async () => {
+    const values = await backfillAccountIdForm.validateFields()
+    const selected = selectedRowKeys.length > 0
+    const body: Record<string, unknown> = {
+      only_missing_account_id: values.only_missing_account_id !== false,
+      concurrency: Number(values.concurrency) || 1,
+      delay_seconds: Number(values.delay_seconds) || 3,
+    }
+    if (selected) {
+      body.account_ids = Array.from(selectedRowKeys).map(Number).filter((id) => Number.isInteger(id) && id > 0)
+    } else {
+      body.all_filtered = true
+      if (search) body.email = search
+      if (filterStatus) body.status = filterStatus
+      if (filterPlusStatus) body.plus_status = filterPlusStatus
+    }
+    setBackfillAccountIdLoading(true)
+    try {
+      const result = await apiFetch('/tasks/backfill-account-id', { method: 'POST', body: JSON.stringify(body) })
+      setBackfillAccountIdTaskId(result.task_id)
+      message.success(`已开始给 ${result.total} 个账号补 ChatGPT Account ID`)
+    } catch (e) {
+      message.error(`补 ChatGPT Account ID 启动失败: ${e instanceof Error ? e.message : String(e)}`)
+    } finally { setBackfillAccountIdLoading(false) }
+  }
+
+  const closeBackfillAccountIdModal = () => {
+    setBackfillAccountIdModalOpen(false)
+    setBackfillAccountIdTaskId(null)
+    backfillAccountIdForm.resetFields()
+  }
+
   const getStatusSyncScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
 
   const getUploadCpaScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
@@ -1624,6 +1660,11 @@ export default function Accounts() {
             </Dropdown>
           )}
           {currentPlatform === 'chatgpt' && (
+            <Button onClick={() => setBackfillAccountIdModalOpen(true)} disabled={total === 0}>
+              {selectedRowKeys.length > 0 ? `补 Account ID (${selectedRowKeys.length})` : '补 Account ID'}
+            </Button>
+          )}
+          {currentPlatform === 'chatgpt' && (
             <Button
               icon={<KeyOutlined />}
               onClick={() => setBackfillRtModalOpen(true)}
@@ -1850,6 +1891,23 @@ export default function Accounts() {
         ) : (
           <TaskLogPanel taskId={backfillRtTaskId} kind="backfill_rt" onDone={() => { load() }} />
         )}
+      </Modal>
+
+      <Modal title="批量补 ChatGPT Account ID" open={backfillAccountIdModalOpen} onCancel={closeBackfillAccountIdModal}
+        footer={null} width={backfillAccountIdTaskId ? 720 : 520} maskClosable={false}>
+        {!backfillAccountIdTaskId ? (
+          <>
+            <Alert type="info" showIcon style={{ marginBottom: 16 }}
+              message={selectedRowKeys.length > 0 ? `处理所选 ${selectedRowKeys.length} 个账号` : `处理当前筛选的 ${total} 个账号`}
+              description="仅使用已有 session/access token 查询只读资料接口；不会重登、读取邮箱、接码或请求验证码。" />
+            <Form form={backfillAccountIdForm} layout="vertical" onFinish={handleBackfillAccountId}>
+              <Form.Item name="only_missing_account_id" label="只补缺 Account ID 的账号" initialValue={true} valuePropName="checked"><Switch /></Form.Item>
+              <Form.Item name="concurrency" label="并发数" initialValue={1}><InputNumber min={1} max={3} style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="delay_seconds" label="账号间隔（秒）" initialValue={3}><InputNumber min={0} style={{ width: '100%' }} /></Form.Item>
+              <Button type="primary" htmlType="submit" loading={backfillAccountIdLoading}>开始补 Account ID</Button>
+            </Form>
+          </>
+        ) : <TaskLogPanel taskId={backfillAccountIdTaskId} kind="backfill_account_id" onDone={load} />}
       </Modal>
 
       <Modal
