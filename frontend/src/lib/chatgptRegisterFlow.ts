@@ -29,7 +29,7 @@ export const CHATGPT_REGISTER_FLOW_OPTIONS: {
   {
     value: CHATGPT_REGISTER_FLOW_PHONE_WITH_EMAIL,
     label: '手机注册 + 绑定邮箱',
-    hint: '先用号码注册，再把邮箱池里的地址绑到账号上，收一次邮件验证码。',
+    hint: '每个号码最多等 4 分钟短信，未验证即退号换号；OpenAI 验证成功后停止换号并绑定邮箱。未绑邮箱的成功账号单独保存。',
   },
 ]
 

@@ -81,6 +81,8 @@ def _flow(responses=()) -> AuthFlow:
     flow._common_headers = lambda referer="": {"Referer": referer}
     flow._trace_http = lambda *args, **kwargs: None
     flow._get_env = lambda key, default="": default
+    # bind_email 的生产逻辑会等 10 秒给邮件投递；协议单测不等真实时间。
+    flow._sleep_before_email_otp = lambda _seconds: None
     return flow
 
 
@@ -235,9 +237,9 @@ class BindEmailTests(unittest.TestCase):
         flow._normalize_continue_url = lambda url: url
         provider = _FakeMailProvider()
 
-        result = flow._try_bind_email(provider, "https://auth.openai.com/next")
+        result = flow._try_bind_email(provider, "https://auth.openai.com/add-email")
 
-        self.assertEqual(result, "https://auth.openai.com/next")
+        self.assertEqual(result, "https://auth.openai.com/add-email")
         self.assertFalse(flow.result.bound_email)
         self.assertIn("invalid state", flow._bind_email_error)
 

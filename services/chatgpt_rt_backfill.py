@@ -132,19 +132,29 @@ def build_extra_patch(result: BackfillResult) -> dict[str, Any]:
     原有的 session_token 等于把号弄坏。
     """
     patch: dict[str, Any] = {}
-    for key in ("refresh_token", "access_token", "session_token", "id_token"):
+    # 未验证候选 RT 禁止写库；AT/session 等已从可信会话刷新到的字段仍可保留。
+    for key in ("access_token", "session_token", "id_token"):
         value = str(getattr(result, key, "") or "").strip()
         if value:
             patch[key] = value
+    verified_rt = (
+        str(getattr(result, "refresh_token", "") or "").strip()
+        if result.success and result.refresh_token_verified
+        else ""
+    )
+    if verified_rt:
+        patch["refresh_token"] = verified_rt
+        # 只认可经过 refresh-token grant 验证（并已接住轮换值）的 Codex RT。
+        patch["chatgpt_has_refresh_token_solution"] = True
+        patch["chatgpt_refresh_token_source"] = "codex_oauth"
     if result.cookie_header:
         patch["cookies"] = result.cookie_header
-    if result.refresh_token:
-        # 号已经有 RT 了，别再被当成 access_token_only 方案的产物
-        patch["chatgpt_has_refresh_token_solution"] = True
     patch["chatgpt_rt_backfill"] = {
         "ok": result.success,
         "strategy": result.strategy,
         "message": result.summary(),
+        "refresh_token_verified": bool(result.refresh_token_verified),
+        "refresh_token_verify_error": result.refresh_token_verify_error,
         "attempts": [
             {"strategy": item.strategy, "ok": item.ok, "message": item.message}
             for item in result.attempts

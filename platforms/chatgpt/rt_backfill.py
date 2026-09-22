@@ -114,12 +114,15 @@ class BackfillResult:
     id_token: str = ""
     cookie_header: str = ""
     error_message: str = ""
+    # 只有 refresh-token grant 成功拿到 access_token 才允许宣告补 RT 成功。
+    refresh_token_verified: bool = False
+    refresh_token_verify_error: str = ""
     attempts: list[BackfillAttempt] = field(default_factory=list)
 
     def summary(self) -> str:
         if self.success:
             label = "复用会话" if self.strategy == STRATEGY_SESSION else "协议重登"
-            return f"补 RT 成功（{label}）"
+            return f"补 RT 成功（{label}，已验证）"
         return self.error_message or "补 RT 失败"
 
 
@@ -195,16 +198,29 @@ class RefreshTokenBackfiller:
                 self._absorb(result, self._active_flow)
 
             if result.refresh_token:
-                result.success = True
-                result.strategy = strategy
-                note = f"末段报错但 RT 已到手：{failure}" if failure else "拿到 refresh_token"
-                result.attempts.append(BackfillAttempt(strategy, True, note))
-                self.log(f"[补RT] {self._label(strategy)}成功: {self.email}")
-                return result
-
-            message = failure or "流程跑完但没拿到 refresh_token"
-            self.log(f"[补RT] {self._label(strategy)}未果: {message}")
+                # OAuth exchange / session dump 只代表拿到了一个候选字符串；必须用
+                # refresh_token grant 真正换到 AT，且接住可能轮换的新 RT，才能算成功。
+                verified, verify_error = self._verify_refresh_token(self._active_flow, result.refresh_token)
+                if verified:
+                    self._absorb(result, self._active_flow)
+                    result.success = True
+                    result.refresh_token_verified = True
+                    result.refresh_token_verify_error = ""
+                    result.strategy = strategy
+                    note = f"末段报错但 RT 已验证：{failure}" if failure else "refresh_token 已验证"
+                    result.attempts.append(BackfillAttempt(strategy, True, note))
+                    self.log(f"[补RT] {self._label(strategy)}成功（RT 已验证）: {self.email}")
+                    return result
+                result.refresh_token_verify_error = verify_error
+                # 无法验证的候选 RT 绝不能写库或让调用方显示成功。
+                result.refresh_token = ""
+                message = verify_error or "refresh_token 验证失败"
+            else:
+                message = failure or "流程跑完但没拿到 refresh_token"
+            result.success = False
             result.attempts.append(BackfillAttempt(strategy, False, message))
+            self.log(f"[补RT] {self._label(strategy)}未果: {message}")
+            continue
 
         result.error_message = self._compose_error(result)
         return result
@@ -295,6 +311,21 @@ class RefreshTokenBackfiller:
             if not self.password:
                 return "库里没有密码，无法协议重登"
         return ""
+
+    def _verify_refresh_token(self, flow: Optional[AuthFlow], token: str) -> tuple[bool, str]:
+        if flow is None:
+            return False, "RT 验证失败：协议流程不存在"
+        verifier = getattr(flow, "verify_codex_refresh_token", None)
+        if not callable(verifier):
+            return False, "RT 验证失败：当前协议层不支持 refresh-token grant"
+        try:
+            if verifier(token):
+                return True, ""
+            return False, "RT refresh-token grant 被 OpenAI 拒绝"
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            return False, f"RT 验证异常：{exc}"
 
     def _absorb(self, result: BackfillResult, flow: AuthFlow) -> None:
         """把 flow 上拿到的凭证并进结果，只覆盖非空值。

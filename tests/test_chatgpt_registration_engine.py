@@ -255,7 +255,8 @@ class RegistrationEngineRunTests(unittest.TestCase):
         self.assertEqual(result.metadata["device_id"], "dev-1")
         self.assertEqual(result.metadata["mail_provider"], "microsoft")
         self.assertEqual(result.metadata["client_id"], "mail-client-id")
-        self.assertEqual(result.metadata["refresh_token"], "mail-refresh-token")
+        # ChatGPT 的 refresh_token 已在结果顶层；邮箱 OAuth 凭据必须隔离，不能覆盖它。
+        self.assertEqual(result.metadata["mailbox_refresh_token"], "mail-refresh-token")
         # 协议层拿到的是适配后的邮箱 provider，而不是裸 mailbox
         provider = flow.run_register.call_args.args[0]
         self.assertIsInstance(provider, MailboxProviderAdapter)

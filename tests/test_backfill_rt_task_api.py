@@ -141,6 +141,7 @@ class BackfillTaskEndpointTests(unittest.TestCase):
             email="no-rt-1@example.com",
             strategy=STRATEGY_SESSION,
             refresh_token="rt-new",
+            refresh_token_verified=True,
             access_token="at-new",
             attempts=[BackfillAttempt(STRATEGY_SESSION, True, "拿到 refresh_token")],
         )

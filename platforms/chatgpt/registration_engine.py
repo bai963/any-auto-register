@@ -84,7 +84,13 @@ class RegistrationResult:
                 "device_id": result.device_id,
                 "totp_secret": result.totp_secret,
                 "phone_number": phone_number,
+                "phone_verified": bool(getattr(result, "phone_verified", False)),
                 "bound_email": bound_email,
+                "chatgpt_registration_stage": (
+                    "email_bound" if bound_email else (
+                        "phone_verified" if getattr(result, "phone_verified", False) else ""
+                    )
+                ),
             },
         )
 
@@ -163,10 +169,16 @@ class ChatGPTRegistrationEngine:
         # 只有"开始/失败"两行，出事了连服务端回的是哪个 page 都看不见。
         try:
             with mirror_protocol_logs(self.log):
-                result = flow.run_phone_register(
-                    mail_provider=provider, bind_email=bind_email,
-                    mail_provider_factory=self._build_mail_provider if bind_email else None,
-                )
+                phone_kwargs = {
+                    "mail_provider": provider,
+                    "bind_email": bind_email,
+                    "mail_provider_factory": self._build_mail_provider if bind_email else None,
+                }
+                if bind_email:
+                    # 该模式必须先取得 OpenAI 对手机号 OTP 的确认；此前每个
+                    # 号码超时都会退号并继续租下一号。
+                    phone_kwargs["retry_phone_until_verified"] = True
+                result = flow.run_phone_register(**phone_kwargs)
         except Exception as exc:
             registration = self._salvage(flow, exc)
             self._record_phone_bind_mailbox_statuses(flow, provider, registration)
@@ -180,7 +192,13 @@ class ChatGPTRegistrationEngine:
         self._record_phone_bind_mailbox_statuses(flow, provider, registration)
         registration = self._attach_mailbox_credentials(registration, provider)
         registration.metadata["email_bind_status"] = getattr(flow, "_email_bind_status", "not_attempted")
-        registration.metadata["email_bind_attempts"] = len(getattr(flow, "_email_bind_providers", []) or [])
+        registration.metadata["email_bind_attempts"] = len(self._email_bind_providers(flow))
+        phone_verified = bool(getattr(result, "phone_verified", False))
+        registration.metadata["phone_verified"] = phone_verified
+        if phone_verified and not registration.metadata.get("bound_email"):
+            registration.metadata["chatgpt_registration_stage"] = "phone_verified"
+        elif registration.metadata.get("bound_email"):
+            registration.metadata["chatgpt_registration_stage"] = "email_bound"
         bind_error = getattr(flow, "_bind_email_error", "")
         if bind_email and not registration.metadata.get("bound_email"):
             registration.metadata["bind_email_error"] = bind_error or "未绑定邮箱"
@@ -190,7 +208,7 @@ class ChatGPTRegistrationEngine:
     @staticmethod
     def _bound_mail_provider(flow: AuthFlow, fallback: Optional[MailboxProviderAdapter]):
         """返回实际绑成功的邮箱 provider，供凭据保存和后续 2FA 使用。"""
-        for provider in reversed(getattr(flow, "_email_bind_providers", []) or []):
+        for provider in reversed(ChatGPTRegistrationEngine._email_bind_providers(flow)):
             if getattr(provider, "_email_bind_status", "") == "used":
                 return provider
         return fallback
@@ -241,11 +259,17 @@ class ChatGPTRegistrationEngine:
                 registration.metadata["mail_provider"] = provider_name
         return registration
 
+    @staticmethod
+    def _email_bind_providers(flow: AuthFlow) -> list:
+        """读取协议层实际领取过的邮箱；对测试替身或旧流程的缺失字段安全降级。"""
+        providers = getattr(flow, "_email_bind_providers", [])
+        return list(providers) if isinstance(providers, (list, tuple)) else []
+
     def _record_phone_bind_mailbox_statuses(
         self, flow: AuthFlow, initial_provider: Optional[MailboxProviderAdapter], registration: RegistrationResult
     ) -> None:
         """邮箱池只按实际绑定结果结算；未领取的邮箱不写状态。"""
-        providers = list(getattr(flow, "_email_bind_providers", []) or [])
+        providers = self._email_bind_providers(flow)
         if not providers and initial_provider is not None:
             # 非绑定流程或协议层在领取前失败时，保持旧的失败回写语义。
             if self.register_flow != REGISTER_FLOW_PHONE_WITH_EMAIL:
@@ -394,6 +418,10 @@ class ChatGPTRegistrationEngine:
             # 没有意义，外层本来就会换下一个邮箱重试。
             "WEBUI_ALLOW_LOGIN": "1",
         }
+
+        if self.register_flow == REGISTER_FLOW_PHONE_WITH_EMAIL:
+            # phone_with_email 固定给每个号码四分钟收短信，不被通用接码设置覆盖。
+            overrides["OPENAI_PHONE_OTP_TIMEOUT"] = "240"
 
         if self.mode == REGISTRATION_MODE_ACCESS_TOKEN_ONLY:
             # 不要 refresh_token 就别跑 Codex OAuth：每次都要多花约 10 秒且必然告警

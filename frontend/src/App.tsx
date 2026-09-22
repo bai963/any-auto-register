@@ -119,11 +119,14 @@ function AppContent() {
       key: '/accounts',
       icon: <UserOutlined />,
       label: '平台管理',
-      children: platforms.map(p => ({
-        // iCloud 有主号 + 隐私邮箱的专属控制台，不走通用账号列表。
-        key: p.key === 'icloud' ? '/icloud' : `/accounts/${p.key}`,
-        label: p.label,
-      })),
+      children: [
+        ...platforms.map(p => ({
+          // iCloud 有主号 + 隐私邮箱的专属控制台，不走通用账号列表。
+          key: p.key === 'icloud' ? '/icloud' : `/accounts/${p.key}`,
+          label: p.label,
+        })),
+        { key: '/accounts/chatgpt-phone', label: '单手机号账号' },
+      ],
     },
     {
       key: '/history',
@@ -229,6 +232,7 @@ function AppContent() {
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/accounts" element={<Accounts />} />
+            <Route path="/accounts/chatgpt-phone" element={<Accounts />} />
             <Route path="/accounts/:platform" element={<Accounts />} />
             <Route path="/register" element={<RegisterTaskPage />} />
             <Route path="/icloud" element={<ICloudPage />} />

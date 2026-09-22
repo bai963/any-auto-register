@@ -45,6 +45,9 @@ PHONE_USERNAME_KIND = "phone_number"
 
 # 短信验证码页面：手机和邮箱的验证码页在 OpenAI 那边共用 /contact-verification
 PHONE_VERIFICATION_REFERER = "https://auth.openai.com/contact-verification"
+# 邮件供应商通常需要数秒才会把 add-email OTP 投递到可查询的收件箱。
+# 先等再首次轮询，避免高并发下对邮箱 API/IMAP 造成无意义的瞬时读峰值。
+EMAIL_OTP_INITIAL_DELAY_SECONDS = 10
 
 # 这个号不能用，换下一个再试。接码平台的号是回收再卖的，"已被占用"是常态，
 # 服务端的说法有下划线（code）和大白话（message）两种，两种都得认。
@@ -424,6 +427,11 @@ class PhoneRegisterMixin:
                 otp_timeout = max(10, int(self._get_env("OTP_TIMEOUT", "180")))
             except Exception:
                 otp_timeout = 180
+            logger.info(
+                "[绑定邮箱] 验证码已发送，等待 %ds 后开始读取邮箱: %s",
+                EMAIL_OTP_INITIAL_DELAY_SECONDS, email,
+            )
+            self._sleep_before_email_otp(EMAIL_OTP_INITIAL_DELAY_SECONDS)
             code = mail_provider.wait_for_otp(email, timeout=otp_timeout, issued_after=sent_at)
             validate_resp = self.verify_otp(code)
             self.result.bound_email = email
@@ -436,6 +444,21 @@ class PhoneRegisterMixin:
             # 引擎据此按真实结果回写邮箱池；这里不吞异常，外层决定是否换邮箱。
             setattr(mail_provider, "_email_bind_status", "failed")
             raise
+
+    def _sleep_before_email_otp(self, seconds: float) -> None:
+        """可中断地等待邮件投递，避免直接 sleep 让 stop/skip 失效。"""
+        deadline = time.monotonic() + max(float(seconds or 0), 0.0)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            # AuthFlow 在独立协议使用时没有 task control；Web 任务会注入它。
+            control = getattr(self, "_task_control", None)
+            if control is not None:
+                control.checkpoint(
+                    attempt_id=getattr(self, "_task_attempt_token", None)
+                )
+            time.sleep(min(0.25, remaining))
 
     @staticmethod
     def _is_email_verification_state(page_type: str = "", continue_url: str = "") -> bool:
@@ -498,6 +521,7 @@ class PhoneRegisterMixin:
         mail_provider: Optional[MailProvider] = None,
         bind_email: bool = False,
         mail_provider_factory=None,
+        retry_phone_until_verified: bool = False,
     ) -> Any:
         """用接码平台的手机号注册一个账号，可选把邮箱绑上去。"""
         if self._sms_callback is None:
@@ -521,7 +545,9 @@ class PhoneRegisterMixin:
 
         ctrl = self._sms_callback
         try:
-            continue_url, auth_url = self._do_phone_register_loop(ctrl)
+            continue_url, auth_url = self._do_phone_register_loop(
+                ctrl, retry_until_phone_verified=retry_phone_until_verified
+            )
         finally:
             for cleanup in (getattr(ctrl, "cleanup", None), getattr(ctrl, "_release_lock", None)):
                 if callable(cleanup):
@@ -545,7 +571,7 @@ class PhoneRegisterMixin:
 
         return self._finish_authorized_flow(continue_url, auth_url, mail_provider)
 
-    def _do_phone_register_loop(self, ctrl) -> tuple:
+    def _do_phone_register_loop(self, ctrl, *, retry_until_phone_verified: bool = False) -> tuple:
         """一个号一个号地试：租号 → 提交身份 → 注册 → 收短信 → 验码。
 
         返回 ``(continue_url, auth_url)``；auth_url 留给后面 reauthorize 兜底用。
@@ -568,11 +594,15 @@ class PhoneRegisterMixin:
         max_code_retries = _read_int(
             "sms_code_retries_per_phone", "OPENAI_PHONE_OTP_CODE_RETRIES", "2"
         )
+        if retry_until_phone_verified:
+            # phone_with_email 的业务语义：每个号码给足四分钟；号码未被
+            # OpenAI 验证前持续退号换号，不受旧的三次上限影响。
+            per_phone_timeout = 240
 
         logger.info(
-            "[手机注册] 配置: 单号窗口=%ds 最多换号=%d 单号内验证重试=%d",
+            "[手机注册] 配置: 单号窗口=%ds %s 单号内验证重试=%d",
             per_phone_timeout,
-            max_phone_attempts,
+            "持续换号直到 OpenAI 验证通过" if retry_until_phone_verified else f"最多换号={max_phone_attempts}",
             max_code_retries,
         )
 
@@ -581,23 +611,33 @@ class PhoneRegisterMixin:
         repeated_count = 0
         self._phone_sms_ever_received = False
 
-        for attempt in range(1, max_phone_attempts + 1):
-            logger.info("[手机注册] 🔁 第 %d/%d 个号尝试...", attempt, max_phone_attempts)
+        attempt = 0
+        while retry_until_phone_verified or attempt < max_phone_attempts:
+            attempt += 1
+            total_label = "∞" if retry_until_phone_verified else str(max_phone_attempts)
+            logger.info("[手机注册] 🔁 第 %d/%s 个号尝试...", attempt, total_label)
             try:
                 phone = ctrl.get_phone()
             except Exception as exc:
                 last_err = exc
+                # provider 可能在拿到 activation 后的本地处理阶段抛异常；统一
+                # cleanup，确保下一次租号前不会遗留可计费号码。
+                self._cleanup_phone(ctrl)
                 logger.warning("[手机注册] 第 %d 个号租号失败: %s", attempt, exc)
                 continue
             if not phone:
                 last_err = RuntimeError("接码平台未返回手机号")
+                self._cleanup_phone(ctrl)
                 continue
 
             self.result.phone_number = phone
             self.result.email = phone
 
             try:
-                continue_url, auth_url = self._register_with_phone(phone, ctrl, per_phone_timeout, max_code_retries)
+                continue_url, auth_url = self._register_with_phone(
+                    phone, ctrl, per_phone_timeout, max_code_retries,
+                    retry_until_phone_verified=retry_until_phone_verified,
+                )
             except _PhoneUnusable as exc:
                 last_err = exc.cause
                 logger.warning("[手机注册] 号 %s 不可用，换下一个: %s", phone, str(exc.cause)[:200])
@@ -608,28 +648,46 @@ class PhoneRegisterMixin:
                 self._cleanup_phone(ctrl)
                 continue
             except PhoneAccountCreatedError as exc:
-                # 账号已经建好了，换号只会再造一个孤号。这里既不上报"号码有问题"
-                # （号码是好的，退款理由不成立），也不再往下试。
+                if retry_until_phone_verified:
+                    # phone_with_email 以 OpenAI 手机 OTP 通过为唯一停止换号条件。
+                    # 此时虽可能已 user/register，但尚未验证手机；既然要换号，必须
+                    # 取消当前 activation，不能 finish 后留下不可退款号码。
+                    last_err = exc
+                    logger.warning(
+                        "[手机注册] 号 %s 已创建半成品但未验证手机，退号后换下一个: %s",
+                        phone, str(exc)[:200],
+                    )
+                    self._cleanup_phone(ctrl)
+                    continue
+                # 普通 phone 模式维持旧行为：账号已创建后不再制造更多孤号。
                 logger.warning(
                     "[手机注册] 账号已在 OpenAI 侧创建但后续步骤失败，停止换号: %s", exc
                 )
-                # 这个号已经挂在那个半成品账号上了，外层再开一轮必须换新号，
-                # 否则只会一直撞 phone_number_in_use
                 try:
                     ctrl.complete_activation(f"号 {phone} 已注册出账号")
                 except Exception:
                     pass
                 raise
             except _PhoneFlowBroken as exc:
-                logger.warning(
-                    "[手机注册] 服务端流程状态已失效（%s）：这不是号码问题，本轮到此为止",
-                    str(exc.cause)[:200],
-                )
+                # 普通 phone 模式下 invalid_state 与号码无关，维持 fail-fast；
+                # phone_with_email 的约定则是手机号未获 OpenAI 确认前持续换号。
+                # 无论哪种路径，已经租出的 activation 都必须先退掉。
                 try:
                     ctrl.mark_send_failed(str(exc.cause))
                 except Exception:
                     pass
                 self._cleanup_phone(ctrl)
+                if retry_until_phone_verified:
+                    last_err = exc.cause
+                    logger.warning(
+                        "[手机注册] 服务端流程状态失效，当前号已退，继续换号: %s",
+                        str(exc.cause)[:200],
+                    )
+                    continue
+                logger.warning(
+                    "[手机注册] 服务端流程状态已失效（%s）：这不是号码问题，本轮到此为止",
+                    str(exc.cause)[:200],
+                )
                 raise exc.cause
             except Exception as exc:
                 last_err = exc
@@ -645,7 +703,7 @@ class PhoneRegisterMixin:
                 else:
                     repeated_err = text
                     repeated_count = 1
-                if repeated_count >= 3:
+                if repeated_count >= 3 and not retry_until_phone_verified:
                     logger.warning(
                         "[手机注册] 同一个错误连续 %d 个号了，判定与号码无关，停止换号",
                         repeated_count,
@@ -653,10 +711,14 @@ class PhoneRegisterMixin:
                     break
                 continue
 
+            # 至此 OpenAI 已接受当前号码并完成了手机号阶段；后续邮箱失败
+            # 也绝不能再租新号。接码 activation 正常结算而不是退号。
+            self.result.phone_verified = True
             try:
                 ctrl.report_success()
             except Exception:
-                pass
+                logger.exception("[手机注册] 手机验证成功后的接码结算失败")
+            logger.info("[手机注册] OpenAI 已验证手机号 %s，停止换号", phone)
             return continue_url, auth_url
 
         if last_err:
@@ -676,6 +738,8 @@ class PhoneRegisterMixin:
         ctrl,
         per_phone_timeout: int,
         max_code_retries: int,
+        *,
+        retry_until_phone_verified: bool = False,
     ) -> tuple:
         """单个号码的完整尝试。
 
@@ -745,7 +809,19 @@ class PhoneRegisterMixin:
                 ),
                 auth_url,
             )
-        except PhoneAccountCreatedError:
+        except _PhoneUnusable as exc:
+            # 仅 phone_with_email 把「账号已创建、但手机 OTP 尚未验证」也视为
+            # 可退号换号；普通 phone 模式保留历史的半成品账号保护。
+            if retry_until_phone_verified:
+                raise
+            cause = exc.cause
+            raise PhoneAccountCreatedError(
+                str(cause),
+                phone=phone,
+                password=self.result.password,
+                sms_ever_received=self._phone_sms_ever_received,
+            ) from cause
+        except (_PhoneFlowBroken, PhoneAccountCreatedError):
             raise
         except Exception as exc:
             cause = getattr(exc, "cause", exc)

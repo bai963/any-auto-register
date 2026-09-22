@@ -18,7 +18,7 @@ from core.task_runtime import (
     global_openai_limiter,
     global_sms_limiter,
 )
-import time, json, asyncio, threading, logging, multiprocessing, queue
+import time, json, asyncio, threading, logging, multiprocessing, queue, os
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 logger = logging.getLogger(__name__)
@@ -53,7 +53,16 @@ TASK_STALL_DIAGNOSIS_SECONDS = 120
 # 邮箱绑定余量，普通流程也不允许无限占住 40/200 worker 槽位。
 REGISTER_ATTEMPT_TIMEOUT_SECONDS = 300
 PHONE_REGISTER_ATTEMPT_TIMEOUT_SECONDS = 360
-PHONE_WITH_EMAIL_ATTEMPT_TIMEOUT_SECONDS = 480
+
+
+def _should_run_register_in_child_process() -> bool:
+    """生产请求隔离不可信协议 I/O；pytest 内需保留同一解释器的 mock/计数器。
+
+    spawn 会重新 import registry，单元测试对 ``core.registry.get`` 的 patch 与
+    ``_FlakyPlatform.attempts`` 均不会跨进程继承，导致测试实际跑到真实 ChatGPT
+    流程。正式服务不设置 PYTEST_CURRENT_TEST，仍始终使用可硬回收的子进程。
+    """
+    return not bool(os.environ.get("PYTEST_CURRENT_TEST"))
 
 
 def _register_platform_child(payload: dict, result_queue) -> None:
@@ -86,11 +95,13 @@ def _register_platform_child(payload: dict, result_queue) -> None:
         result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
-def _attempt_timeout_seconds(platform: str, extra: dict) -> int:
+def _attempt_timeout_seconds(platform: str, extra: dict) -> Optional[int]:
     if platform == "chatgpt":
         flow = str((extra or {}).get("chatgpt_register_flow") or "").strip().lower()
         if flow == "phone_with_email":
-            return PHONE_WITH_EMAIL_ATTEMPT_TIMEOUT_SECONDS
+            # 号码未验证前会按四分钟窗口持续退号换号，不能由 attempt deadline 杀掉。
+            # stop/skip、子进程崩溃和接码 journal 清理仍然有效。
+            return None
         if flow == "phone" or uses_sms_register_flow(extra):
             return PHONE_REGISTER_ATTEMPT_TIMEOUT_SECONDS
     return REGISTER_ATTEMPT_TIMEOUT_SECONDS
@@ -716,22 +727,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 # Windows/线程模式下第三方 DNS、IMAP 或供应商库可永久卡住；注册主体
                 # 放进独立 spawn 子进程，父线程能在 deadline 后 terminate 并回收槽位。
                 _heartbeat(attempt_id, "platform_register")
-                try:
-                    child_context = multiprocessing.get_context("spawn")
-                    child_queue = child_context.Queue()
-                    child = child_context.Process(
-                        target=_register_platform_child,
-                        args=({
-                            "platform": req.platform, "executor_type": req.executor_type,
-                            "captcha_solver": req.captcha_solver, "proxy": _proxy,
-                            "extra": dict(merged_extra), "email": req.email, "password": req.password,
-                        }, child_queue), daemon=True,
-                    )
-                    child.start()
-                except OSError as exc:
-                    # 某些受限 Windows 会话（包括 CI）禁止 spawn。降级保留原线程链路，
-                    # 不能让注册因操作系统策略全部失败；正常服务进程仍使用子进程硬回收。
-                    _log(task_id, f"[SYSTEM] 子进程不可用，降级线程执行: {exc}")
+                def _run_in_current_process(reason: str = "") -> None:
+                    nonlocal child, account, _mailbox
+                    if reason:
+                        _log(task_id, f"[SYSTEM] {reason}，降级线程执行")
                     _heartbeat(attempt_id, "fallback_thread_register")
                     _mailbox = _build_mailbox(_proxy)
                     _platform = PlatformCls(config=_config, mailbox=_mailbox)
@@ -743,7 +742,29 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         _platform.mailbox._log_fn = _platform._log_fn
                     account = _platform.register(email=req.email or None, password=req.password)
                     child = None
-                deadline = time.monotonic() + _attempt_timeout_seconds(req.platform, merged_extra)
+
+                account = None
+                if not _should_run_register_in_child_process():
+                    # pytest 需要 mock、类变量计数和注册表 patch 均留在当前进程。
+                    _run_in_current_process("pytest 环境禁用注册子进程")
+                else:
+                    try:
+                        child_context = multiprocessing.get_context("spawn")
+                        child_queue = child_context.Queue()
+                        child = child_context.Process(
+                            target=_register_platform_child,
+                            args=({
+                                "platform": req.platform, "executor_type": req.executor_type,
+                                "captcha_solver": req.captcha_solver, "proxy": _proxy,
+                                "extra": dict(merged_extra), "email": req.email, "password": req.password,
+                            }, child_queue), daemon=True,
+                        )
+                        child.start()
+                    except OSError as exc:
+                        # 某些受限 Windows 会话（包括 CI）禁止 spawn。降级保留原线程链路。
+                        _run_in_current_process(f"子进程不可用: {exc}")
+                attempt_timeout = _attempt_timeout_seconds(req.platform, merged_extra)
+                deadline = time.monotonic() + attempt_timeout if attempt_timeout is not None else None
                 account = locals().get("account", None)
                 child_error = ""
                 while child is not None and child.is_alive() and not account and not child_error:
@@ -752,13 +773,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         kind, value = child_queue.get(timeout=1.0)
                     except queue.Empty:
                         _heartbeat(attempt_id, "child_register")
-                        if time.monotonic() >= deadline:
+                        if deadline is not None and time.monotonic() >= deadline:
                             from services.sms_service import cancel_expired_sms_activations
                             cancelled = cancel_expired_sms_activations(merged_extra, proxy=_proxy)
                             child.terminate()
                             child.join(timeout=10)
                             raise TimeoutError(
-                                f"单账号注册超过 {_attempt_timeout_seconds(req.platform, merged_extra)}s，"
+                                f"单账号注册超过 {attempt_timeout}s，"
                                 f"已终止子进程；超时接码取消 {cancelled} 个"
                             )
                         continue

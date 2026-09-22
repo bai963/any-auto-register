@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from core.db import DATABASE_REGISTER_CONCURRENCY_CAP
 import requests
 
 logger = logging.getLogger(__name__)
@@ -57,14 +58,24 @@ SMS_PROVIDERS: dict[str, dict[str, str]] = {
 def _sms_limit(name: str, default: int) -> int:
     import os
     try:
-        return max(1, min(int(os.getenv(name, str(default))), 200))
+        # 接码 HTTP 的局部预算绝不可以突破数据库模式下的任务硬上限：
+        # PostgreSQL 为 200，SQLite 为 40。
+        return max(1, min(int(os.getenv(name, str(default))), DATABASE_REGISTER_CONCURRENCY_CAP))
     except ValueError:
         return default
 
 
-_SMS_RENT_SEMAPHORE = threading.BoundedSemaphore(_sms_limit("SMS_RENT_MAX_CONCURRENCY", 5))
-_SMS_POLL_SEMAPHORE = threading.BoundedSemaphore(_sms_limit("SMS_POLL_MAX_CONCURRENCY", 30))
-_SMS_CLOSE_SEMAPHORE = threading.BoundedSemaphore(_sms_limit("SMS_CLOSE_MAX_CONCURRENCY", 10))
+# 租号接口常有供应商侧 QPS 限制，不能因为注册 worker=200 就同时请求 200 次；
+# 轮询和退号则必须覆盖全部活跃 activation，保证四分钟超时能及时退号。
+_SMS_RENT_SEMAPHORE = threading.BoundedSemaphore(
+    _sms_limit("SMS_RENT_MAX_CONCURRENCY", 50 if DATABASE_REGISTER_CONCURRENCY_CAP == 200 else 15)
+)
+_SMS_POLL_SEMAPHORE = threading.BoundedSemaphore(
+    _sms_limit("SMS_POLL_MAX_CONCURRENCY", DATABASE_REGISTER_CONCURRENCY_CAP)
+)
+_SMS_CLOSE_SEMAPHORE = threading.BoundedSemaphore(
+    _sms_limit("SMS_CLOSE_MAX_CONCURRENCY", 100 if DATABASE_REGISTER_CONCURRENCY_CAP == 200 else 30)
+)
 
 
 @contextmanager

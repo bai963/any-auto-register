@@ -56,6 +56,7 @@ class AuthResult:
         self.totp_secret: str = ""
         # 手机号注册链路专用：账号身份是手机号，邮箱是后来绑上去的（可能没绑上）
         self.phone_number: str = ""
+        self.phone_verified: bool = False
         self.bound_email: str = ""
 
     def is_valid(self) -> bool:
@@ -74,6 +75,7 @@ class AuthResult:
             "cookie_header": self.cookie_header,
             "totp_secret": self.totp_secret,
             "phone_number": self.phone_number,
+            "phone_verified": self.phone_verified,
             "bound_email": self.bound_email,
         }
 
@@ -1305,6 +1307,73 @@ class AuthFlow(PhoneRegisterMixin):
 
         return callback_url, final_url
 
+    def verify_codex_refresh_token(self, refresh_token: str) -> bool:
+        """用 refresh_token grant 验证刚取得的 Codex RT，并接住轮换后的 RT。
+
+        非空字符串不能证明 RT 可用；尤其 client_auth_session dump 中的同名字段
+        可能是过期值或并非当前 Codex client 的凭据。验证成功必须拿到 access_token。
+        若服务端轮换 refresh_token，立即覆盖为新值，避免将刚失效的旧值落库。
+        """
+        candidate = str(refresh_token or "").strip()
+        if not candidate:
+            return False
+        client_id = (
+            str(getattr(self, "_oauth_client_id", "") or "").strip()
+            or self._get_env("OAUTH_CODEX_CLIENT_ID", "").strip()
+            or "app_EMoamEEZ73f0CkXaXp7hrann"
+        )
+        redirect_uri = (
+            str(getattr(self, "_oauth_redirect_uri", "") or "").strip()
+            or self._get_env("OAUTH_CODEX_REDIRECT_URI", "").strip()
+            or "http://localhost:1455/auth/callback"
+        )
+        form = urlencode({
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "refresh_token": candidate,
+            "redirect_uri": redirect_uri,
+        })
+        try:
+            response = self.session.post(
+                "https://auth.openai.com/oauth/token",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                    "Origin": "https://auth.openai.com",
+                    "User-Agent": self._ua,
+                },
+                data=form,
+                timeout=30,
+            )
+            self._trace_http("oauth_refresh_token_verify", response)
+        except Exception as exc:
+            logger.warning("Codex RT 验证请求异常: %s", exc)
+            return False
+        if getattr(response, "status_code", 0) != 200:
+            logger.warning(
+                "Codex RT 验证失败: HTTP %s - %s",
+                getattr(response, "status_code", 0), describe_error(getattr(response, "text", "")),
+            )
+            return False
+        try:
+            data = response.json()
+        except Exception:
+            logger.warning("Codex RT 验证失败：响应不是 JSON")
+            return False
+        if not isinstance(data, dict):
+            logger.warning("Codex RT 验证失败：响应格式错误")
+            return False
+        access_token = str(data.get("access_token") or "").strip()
+        if not access_token:
+            logger.warning("Codex RT 验证失败：响应未包含 access_token")
+            return False
+        rotated = str(data.get("refresh_token") or "").strip()
+        self.result.access_token = access_token
+        self.result.refresh_token = rotated or candidate
+        self.result.id_token = str(data.get("id_token") or self.result.id_token or "").strip()
+        logger.info("Codex RT 验证成功: refresh=%s", "已轮换" if rotated else "可用")
+        return True
+
     def oauth_codex_rt_exchange(self, mail_provider: Optional[MailProvider] = None) -> bool:
         """
         纯协议方式获取 RT（参考 any-auto-register）：
@@ -1614,21 +1683,25 @@ class AuthFlow(PhoneRegisterMixin):
         统一走 _navigation_headers 后，用真实 CF 域名跑完整 run_register
         **3/3 全成功**（各约 100s，password + access_token 齐全），409 = 0。
         """
-        headers = self._navigation_headers()
-        # warmup 可以重连，但必须复用本流程开始时确定的同一份指纹。
-        # 不可在这里切换浏览器家族，否则后续授权链与 warmup cookie 画像不一致。
-        fixed_impersonate = self._fingerprint.get("impersonate", "")
-        fixed_user_agent = self._ua
+        # 第一次沿用初始化会话；之后每次失败均更换到不同浏览器家族。
+        # warmup 尚未取得 oai-did，失败会话没有可保留的登录态；必须让 TLS、UA
+        # 和 Client Hints 一起切换，不能只改 curl impersonate 造成画像自相矛盾。
+        initial_impersonate = self._fingerprint.get("impersonate", "")
+        cross_family = list(cross_family_impersonates(initial_impersonate, random.Random()))
 
         for attempt in range(4):
             if attempt:
                 time.sleep(3 + attempt * 2)
-                # 仅创建新连接；TLS、UA 与请求头继续使用同一会话指纹。
+                # 4 次预算内，每次重试选择一个不同于初始家族的候选；候选耗尽时
+                # 再使用最后一个跨家族画像，绝不回到已被 CF 拒绝的初始家族。
+                impersonate = cross_family[min(attempt - 1, len(cross_family) - 1)] if cross_family else initial_impersonate
+                self._switch_browser_family(impersonate)
                 self.session = create_http_session(
                     proxy=self.config.proxy,
-                    impersonate=fixed_impersonate,
-                    user_agent=fixed_user_agent,
+                    impersonate=self._fingerprint.get("impersonate", impersonate),
+                    user_agent=self._ua,
                 )
+            headers = self._navigation_headers()
             try:
                 resp = self.session.get(
                     "https://chatgpt.com", headers=headers, timeout=40,
@@ -1659,7 +1732,7 @@ class AuthFlow(PhoneRegisterMixin):
             )
 
         logger.error(
-            "warmup 4 次均未种到 oai-did cookie（始终保持同一指纹）"
+            "warmup 4 次均未种到 oai-did cookie（已跨浏览器家族重试）"
             " —— 此时继续走注册链必然 409 invalid_state"
         )
         return False

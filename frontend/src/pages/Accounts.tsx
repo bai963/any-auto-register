@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
-import { useParams } from 'react-router-dom'
+import { useParams, useLocation } from 'react-router-dom'
 import {
   Table,
   Button,
@@ -752,8 +752,10 @@ function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => vo
 
 export default function Accounts() {
   const { platform } = useParams<{ platform: string }>()
+  const location = useLocation()
   const { token } = theme.useToken()
-  const [currentPlatform, setCurrentPlatform] = useState(platform || 'chatgpt')
+  const phoneOnlyPage = location.pathname === '/accounts/chatgpt-phone'
+  const [currentPlatform, setCurrentPlatform] = useState(phoneOnlyPage ? 'chatgpt' : (platform || 'chatgpt'))
   const [accounts, setAccounts] = useState<any[]>([])
   const [platformActions, setPlatformActions] = useState<any[]>([])
   const [total, setTotal] = useState(0)
@@ -797,8 +799,8 @@ export default function Accounts() {
   const [backfillRtForm] = Form.useForm()
 
   useEffect(() => {
-    if (platform) setCurrentPlatform(platform)
-  }, [platform])
+    setCurrentPlatform(phoneOnlyPage ? 'chatgpt' : (platform || 'chatgpt'))
+  }, [platform, phoneOnlyPage])
 
   useEffect(() => {
     if (!detailModalOpen || !currentAccount) return
@@ -819,6 +821,8 @@ export default function Accounts() {
     setLoading(true)
     try {
       const params = new URLSearchParams({ platform: currentPlatform, page: String(page), page_size: String(pageSize) })
+      if (phoneOnlyPage) params.set('account_group', 'chatgpt_phone_only')
+      else if (currentPlatform === 'chatgpt') params.set('account_group', 'exclude_chatgpt_phone_only')
       if (search) params.set('email', search)
       if (filterStatus) params.set('status', filterStatus)
       if (filterPlusStatus) params.set('plus_status', filterPlusStatus)
@@ -830,7 +834,7 @@ export default function Accounts() {
     } finally {
       setLoading(false)
     }
-  }, [currentPlatform, search, filterStatus, filterPlusStatus, createdAtStart, createdAtEnd, page, pageSize])
+  }, [currentPlatform, phoneOnlyPage, search, filterStatus, filterPlusStatus, createdAtStart, createdAtEnd, page, pageSize])
 
   useEffect(() => {
     load()
@@ -1539,6 +1543,15 @@ export default function Accounts() {
 
   return (
     <div>
+      {phoneOnlyPage && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="单手机号注册成功"
+          description="这些账号已通过 OpenAI 手机验证码，但没有完成邮箱绑定；手机号即账号标识。"
+        />
+      )}
       <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
         <Space>
           <Input.Search

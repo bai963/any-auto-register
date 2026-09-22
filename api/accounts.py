@@ -89,6 +89,7 @@ def list_accounts(
     status: Optional[str] = None,
     email: Optional[str] = None,
     plus_status: Optional[str] = None,
+    account_group: Optional[str] = None,
     created_at_start: Optional[datetime] = None,
     created_at_end: Optional[datetime] = None,
     page: int = 1,
@@ -106,6 +107,24 @@ def list_accounts(
         created_at_start=created_at_start,
         created_at_end=created_at_end,
     )
+    # 手机 OTP 已成功、但尚未绑定邮箱的 phone_with_email 账号单独展示。
+    normalized_group = str(account_group or "").strip().lower()
+    if normalized_group:
+        def _is_chatgpt_phone_only(row: AccountModel) -> bool:
+            try:
+                extra = row.get_extra()
+            except Exception:
+                extra = {}
+            return (
+                row.platform == "chatgpt"
+                and str(extra.get("chatgpt_register_flow") or "") == "phone_with_email"
+                and str(extra.get("chatgpt_registration_stage") or "") == "phone_verified"
+                and not str(extra.get("bound_email") or "").strip()
+            )
+        if normalized_group == "chatgpt_phone_only":
+            rows = [row for row in rows if _is_chatgpt_phone_only(row)]
+        elif normalized_group == "exclude_chatgpt_phone_only":
+            rows = [row for row in rows if not _is_chatgpt_phone_only(row)]
     total = len(rows)
     start = max(page - 1, 0) * page_size
     return {"total": total, "page": page, "items": rows[start : start + page_size]}

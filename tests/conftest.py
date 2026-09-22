@@ -12,14 +12,20 @@
 
 import atexit
 import os
-import shutil
-import tempfile
 
-# pytest 会在解析参数前加载 conftest。若参数非法，pytest_sessionfinish 不会执行；
-# TemporaryDirectory 的 weakref 清理会在仍持有 SQLite 连接时抛 WinError 32。
-# 这里显式 dispose 并 best-effort 清理，测试临时目录删不掉也不让解释器退出时报错。
-_TMP_DB_DIR = tempfile.mkdtemp(prefix="any-auto-register-pytest-")
-os.environ["DATABASE_URL"] = f"sqlite:///{os.path.join(_TMP_DB_DIR, 'test.db')}"
+# pytest 会在解析参数前加载 conftest。Windows 受控环境中，临时目录下新建
+# 子目录可能没有 SQLite 的可写 ACL；测试库因此直接放在项目 data/（该目录已
+# 被项目用于 SQLite WAL），文件名带 PID，避免并发 pytest 互相覆盖。
+_TEST_WORK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
+os.makedirs(_TEST_WORK_DIR, exist_ok=True)
+_TEST_DB_FILE = os.path.join(_TEST_WORK_DIR, f".pytest-{os.getpid()}.db")
+for suffix in ("", "-wal", "-shm"):
+    try:
+        os.remove(_TEST_DB_FILE + suffix)
+    except FileNotFoundError:
+        pass
+# SQLAlchemy 的 sqlite URL 需要正斜杠路径。
+os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_FILE.replace(chr(92), '/')}"
 
 import core.config_store  # noqa: E402,F401  注册 configs 表
 from core.db import init_db  # noqa: E402  必须在 DATABASE_URL 设好之后再 import
@@ -35,7 +41,11 @@ def _cleanup_test_database() -> None:
     except Exception:
         pass
     try:
-        shutil.rmtree(_TMP_DB_DIR, ignore_errors=True)
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(_TEST_DB_FILE + suffix)
+            except FileNotFoundError:
+                pass
     except Exception:
         pass
 

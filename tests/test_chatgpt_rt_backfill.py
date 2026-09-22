@@ -44,6 +44,8 @@ class _FakeFlow:
         self._session_error = session_error
         self.codex_calls = 0
         self.login_calls = []
+        self.verify_calls = []
+        self.verify_ok = True
 
     def from_existing_credentials(self, session_token, access_token, device_id):
         if session_token or access_token:
@@ -59,6 +61,14 @@ class _FakeFlow:
             for key, value in self._session_result.items():
                 setattr(self.result, key, value)
             return bool(self._session_result.get("refresh_token"))
+        return False
+
+    def verify_codex_refresh_token(self, refresh_token):
+        self.verify_calls.append(refresh_token)
+        if self.verify_ok and refresh_token:
+            self.result.access_token = "at-verified"
+            self.result.refresh_token = f"{refresh_token}-rotated"
+            return True
         return False
 
     def run_protocol_login(self, mail_provider, email, password=""):
@@ -92,10 +102,22 @@ class RefreshTokenBackfillerTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.strategy, STRATEGY_SESSION)
-        self.assertEqual(result.refresh_token, "rt-new")
-        self.assertEqual(result.access_token, "at-new")
+        self.assertEqual(result.refresh_token, "rt-new-rotated")
+        self.assertEqual(result.access_token, "at-verified")
         self.assertEqual(flow.codex_calls, 1)
         self.assertEqual(flow.login_calls, [])
+
+    def test_rejects_unverified_rt_candidate_and_falls_back_to_login(self):
+        session_flow = _FakeFlow(session_result={"refresh_token": "rt-stale"})
+        session_flow.verify_ok = False
+        login_flow = _FakeFlow(login_result={"refresh_token": "rt-login"})
+
+        result = _backfiller([session_flow, login_flow]).run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.strategy, STRATEGY_LOGIN)
+        self.assertEqual(session_flow.verify_calls, ["rt-stale"])
+        self.assertTrue(result.refresh_token_verified)
 
     def test_falls_back_to_protocol_login_when_session_yields_nothing(self):
         session_flow = _FakeFlow()
@@ -104,7 +126,7 @@ class RefreshTokenBackfillerTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.strategy, STRATEGY_LOGIN)
-        self.assertEqual(result.refresh_token, "rt-login")
+        self.assertEqual(result.refresh_token, "rt-login-rotated")
         self.assertEqual(len(login_flow.login_calls), 1)
         self.assertEqual(login_flow.login_calls[0][1:], ("demo@example.com", "pw"))
 
@@ -114,8 +136,8 @@ class RefreshTokenBackfillerTests(unittest.TestCase):
         login_flow = _FakeFlow(login_result={"refresh_token": "rt-login"})
         result = _backfiller([session_flow, login_flow]).run()
 
-        self.assertEqual(result.access_token, "at-refreshed")
-        self.assertEqual(result.refresh_token, "rt-login")
+        self.assertEqual(result.access_token, "at-verified")
+        self.assertEqual(result.refresh_token, "rt-login-rotated")
 
     def test_skips_session_strategy_without_stored_credentials(self):
         login_flow = _FakeFlow(login_result={"refresh_token": "rt-login"})
@@ -158,7 +180,7 @@ class RefreshTokenBackfillerTests(unittest.TestCase):
         result = _backfiller([session_flow, login_flow]).run()
 
         self.assertTrue(result.success)
-        self.assertEqual(result.refresh_token, "rt-login")
+        self.assertEqual(result.refresh_token, "rt-login-rotated")
         self.assertIn("拉 session 超时", result.attempts[-1].message)
 
     def test_interruption_does_not_fall_through_to_the_next_strategy(self):
@@ -313,6 +335,7 @@ class BackfillPersistenceTests(unittest.TestCase):
             email="demo@example.com",
             strategy=STRATEGY_SESSION,
             refresh_token="rt-new",
+            refresh_token_verified=True,
             access_token="at-new",
             attempts=[BackfillAttempt(STRATEGY_SESSION, True, "拿到 refresh_token")],
         )
@@ -328,6 +351,15 @@ class BackfillPersistenceTests(unittest.TestCase):
         self.assertNotIn("id_token", patch)
         self.assertTrue(patch["chatgpt_has_refresh_token_solution"])
         self.assertTrue(patch["chatgpt_rt_backfill"]["ok"])
+
+    def test_unverified_rt_candidate_is_never_written(self):
+        patch = build_extra_patch(
+            self._result(success=False, refresh_token="rt-unverified", refresh_token_verified=False)
+        )
+
+        self.assertNotIn("refresh_token", patch)
+        self.assertNotIn("chatgpt_has_refresh_token_solution", patch)
+        self.assertFalse(patch["chatgpt_rt_backfill"]["refresh_token_verified"])
 
     def test_failed_result_keeps_trace_without_claiming_rt(self):
         patch = build_extra_patch(
@@ -433,7 +465,12 @@ class PluginActionTests(unittest.TestCase):
         from platforms.chatgpt.rt_backfill import BackfillResult
 
         action_result, engine_call = self._run_action(
-            BackfillResult(success=True, strategy=STRATEGY_SESSION, refresh_token="rt-new")
+            BackfillResult(
+                success=True,
+                strategy=STRATEGY_SESSION,
+                refresh_token="rt-new",
+                refresh_token_verified=True,
+            )
         )
 
         self.assertTrue(action_result["ok"])

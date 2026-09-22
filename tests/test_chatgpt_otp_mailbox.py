@@ -179,13 +179,18 @@ class ResolveProviderTests(unittest.TestCase):
     def setUp(self):
         from sqlmodel import Session, delete
 
-        from core.db import ICloudAliasModel, OutlookAccountModel, engine
+        from core.db import ICloudAccountModel, ICloudAliasModel, OutlookAccountModel, engine
 
         self.engine = engine
         with Session(engine) as session:
             session.exec(delete(ICloudAliasModel))
+            session.exec(delete(ICloudAccountModel))
             session.exec(delete(OutlookAccountModel))
+            account = ICloudAccountModel(email="test-icloud-account@example.com")
+            session.add(account)
             session.commit()
+            session.refresh(account)
+            self.icloud_account_id = account.id
 
     def _add_alias(self, address):
         from sqlmodel import Session
@@ -193,7 +198,7 @@ class ResolveProviderTests(unittest.TestCase):
         from core.db import ICloudAliasModel
 
         with Session(self.engine) as session:
-            row = ICloudAliasModel(account_id=1, address=address)
+            row = ICloudAliasModel(account_id=self.icloud_account_id, address=address)
             session.add(row)
             session.commit()
             session.refresh(row)

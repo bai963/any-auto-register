@@ -3144,6 +3144,9 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
         try:
             return imap_conn.select(mailbox_arg, readonly=True)
         except Exception as readonly_error:
+            self.mailbox._log(
+                f"[微软邮箱][IMAP] EXAMINE folder={folder} 被拒绝，改用 SELECT: {readonly_error}"
+            )
             try:
                 return imap_conn.select(mailbox_arg, readonly=False)
             except Exception as select_error:
@@ -3801,6 +3804,48 @@ class OutlookMailbox(BaseMailbox):
                     query = query.with_for_update(skip_locked=True)
                 account = session.exec(query).first()
                 if not account:
+                    # 仅在可领取候选全被已注册账号排除时给出专门提示。
+                    blocked_query = (
+                        select(func.count())
+                        .select_from(OutlookAccountModel)
+                        .where(OutlookAccountModel.enabled == True)
+                        .where(or_(
+                            OutlookAccountModel.status == "available",
+                            OutlookAccountModel.status == None,
+                            OutlookAccountModel.status == "",
+                        ))
+                        .where(func.lower(OutlookAccountModel.email).in_(registered))
+                    )
+                    if wanted_type:
+                        blocked_query = blocked_query.where(self._account_type_matches(
+                            OutlookAccountModel.account_type, wanted_type
+                        ))
+                    registered_count = session.exec(blocked_query).one()
+                    if registered_count:
+                        session.rollback()
+                        raise RuntimeError("微软邮箱账号池中剩余的 available 邮箱都已经注册过了，请导入新的邮箱")
+                    # 指定视图而池中只有另一类型时，不能错误兜底发号。
+                    if wanted_type:
+                        other_type_query = (
+                            select(func.count())
+                            .select_from(OutlookAccountModel)
+                            .where(OutlookAccountModel.enabled == True)
+                            .where(or_(
+                                OutlookAccountModel.status == "available",
+                                OutlookAccountModel.status == None,
+                                OutlookAccountModel.status == "",
+                            ))
+                            .where(~self._account_type_matches(
+                                OutlookAccountModel.account_type, wanted_type
+                            ))
+                        )
+                        other_type_count = session.exec(other_type_query).one()
+                        if other_type_count:
+                            session.rollback()
+                            expected_type = self._describe_pool_account_type(wanted_type)
+                            raise RuntimeError(
+                                f"微软邮箱账号池当前没有 {expected_type} 可领取；其他类型账号不会拿来顶替"
+                            )
                     session.rollback()
                     raise RuntimeError("微软邮箱账号池没有可领取的 available 邮箱，请导入新的邮箱")
 
