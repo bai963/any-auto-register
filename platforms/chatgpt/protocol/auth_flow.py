@@ -1474,6 +1474,43 @@ class AuthFlow(PhoneRegisterMixin):
                 except Exception as e:
                     logger.warning(f"SMS 接码绑号失败: {e}")
 
+            # Codex authorize 直接落到 /add-email（常见于未绑定邮箱的手机号账号）：
+            # 只有服务端明确处于 add-email 状态才领取邮箱；绑定成功后再继续授权链。
+            if (not callback_url) and self._is_add_email_state(page_type="", continue_url=final_url or ""):
+                if callable(email_bind_provider_factory):
+                    logger.info("Codex 授权直接落到 /add-email，尝试绑定邮箱后继续 ...")
+                    try:
+                        provider = email_bind_provider_factory()
+                        continue_url = self._try_bind_email(
+                            provider,
+                            final_url,
+                            mail_provider_factory=email_bind_provider_factory,
+                        )
+                        if self.result.bound_email:
+                            self.result.email = self.result.bound_email
+                            callback_url, final_url = self._follow_authorize_for_callback(
+                                continue_url or auth_url,
+                                redirect_uri,
+                                "codex_authorize_after_add_email",
+                            )
+                            if not callback_url:
+                                no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})
+                                if no_prompt_url and no_prompt_url != auth_url:
+                                    callback_url, final_url = self._follow_authorize_for_callback(
+                                        no_prompt_url,
+                                        redirect_uri,
+                                        "codex_authorize_noprompt_after_add_email",
+                                    )
+                        else:
+                            logger.warning(
+                                "Codex 授权要求 add-email，但绑定未完成: %s",
+                                getattr(self, "_bind_email_error", "") or "未知原因",
+                            )
+                    except Exception as e:
+                        logger.warning(f"Codex 授权 add-email 绑定失败: {e}")
+                else:
+                    logger.warning("Codex 授权要求 add-email，但没有配置可用的邮箱池工厂")
+
             # 兜底：去掉 prompt=login 再发起一次授权
             if not callback_url:
                 no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})

@@ -90,6 +90,77 @@ class PhoneOnlyBackfillRoutingTests(unittest.TestCase):
         mailbox.assert_called_once()
         self.assertFalse(backfiller.call_args.kwargs["phone_only"])
 
+class CodexOAuthAddEmailTests(unittest.TestCase):
+    """Codex authorize 直接落到 /add-email 时也要先绑邮箱再拿 RT。"""
+
+    def _flow(self):
+        from platforms.chatgpt.protocol.auth_flow import AuthFlow, AuthResult
+
+        flow = AuthFlow.__new__(AuthFlow)
+        flow.result = AuthResult()
+        flow.result.email = "+573196556312"
+        flow._codex_rt_attempted = False
+        flow._sms_callback = None
+        flow._env_flag = lambda key, default="0": default
+        flow._build_codex_authorize = lambda: (
+            "https://auth.openai.com/oauth/authorize?prompt=login",
+            "state",
+            "verifier",
+            "http://localhost:1455/auth/callback",
+            "client-id",
+        )
+        flow._is_add_phone_state = lambda page_type="", continue_url="": False
+        flow._is_add_email_state = (
+            lambda page_type="", continue_url="": "/add-email" in (continue_url or "")
+        )
+        flow._drop_query_keys = lambda url, keys: ""
+
+        self.follow_calls = []
+        self.exchange_calls = []
+
+        def follow(start_url, redirect_uri, trace_prefix):
+            self.follow_calls.append((start_url, trace_prefix))
+            if len(self.follow_calls) == 1:
+                return "", "https://auth.openai.com/add-email"
+            return (
+                "https://chatgpt.com/api/auth/callback/openai?code=abc&state=state",
+                "https://chatgpt.com/",
+            )
+
+        def bind(provider, continue_url, mail_provider_factory=None):
+            flow.result.bound_email = "new@example.com"
+            return "https://auth.openai.com/workspace/select"
+
+        def exchange(**kwargs):
+            self.exchange_calls.append(kwargs)
+            flow.result.refresh_token = "rt-after-bind"
+            return True
+
+        flow._follow_authorize_for_callback = follow
+        flow._try_bind_email = bind
+        flow._exchange_codex_callback_code = exchange
+        return flow
+
+    def test_direct_add_email_is_bound_before_callback_exchange(self):
+        flow = self._flow()
+        ok = flow.oauth_codex_rt_exchange(
+            mail_provider=None,
+            email_bind_provider_factory=lambda: object(),
+            login_identifier_kind="phone_number",
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(flow.result.bound_email, "new@example.com")
+        self.assertEqual(flow.result.email, "new@example.com")
+        self.assertEqual(flow.result.refresh_token, "rt-after-bind")
+        self.assertEqual(len(self.follow_calls), 2)
+        self.assertEqual(self.follow_calls[1][0], "https://auth.openai.com/workspace/select")
+        self.assertEqual(len(self.exchange_calls), 1)
+        self.assertEqual(
+            self.exchange_calls[0]["callback_url"],
+            "https://chatgpt.com/api/auth/callback/openai?code=abc&state=state",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
