@@ -217,6 +217,10 @@ class RegisterTaskControl:
                 "targeted_skip_attempts": len(self._skip_active_attempt_ids),
                 "attempt_stage_counts": stages,
                 "oldest_attempt_heartbeat_seconds": int(oldest),
+                # Lets clients age a persisted snapshot locally between polls;
+                # otherwise a quiet high-concurrency task looks frozen at the
+                # stale value from its last database flush.
+                "heartbeat_observed_at": now,
                 "attempts": attempts,
             }
 

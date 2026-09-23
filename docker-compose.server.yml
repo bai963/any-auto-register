@@ -24,6 +24,19 @@ services:
       DATABASE_URL: ${DATABASE_URL:-sqlite:////runtime/account_manager.db}
       # 必须落在挂载卷里，否则每次重建容器都会换密钥，库里的凭据全部作废
       CREDENTIAL_ENCRYPTION_KEY_FILE: /runtime/.secrets/credential_key
+      # SQLite must remain a single web process; PostgreSQL supports the 200-worker cap.
+      WEB_CONCURRENCY: "${WEB_CONCURRENCY:-1}"
+      DB_POOL_SIZE: "${DB_POOL_SIZE:-30}"
+      DB_MAX_OVERFLOW: "${DB_MAX_OVERFLOW:-30}"
+      DB_POOL_TIMEOUT: "${DB_POOL_TIMEOUT:-10}"
+      SMS_REFUND_ALERT_OLDEST_SECONDS: "${SMS_REFUND_ALERT_OLDEST_SECONDS:-300}"
+      SMS_REFUND_ALERT_QUEUE_DEPTH: "${SMS_REFUND_ALERT_QUEUE_DEPTH:-100}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health/sms-refunds >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
     ports:
       - "${APP_PORT_BIND:-127.0.0.1:8000}:8000"
     volumes:

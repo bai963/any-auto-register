@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
-from core.db import init_db
+from core.db import DATABASE_BACKEND, init_db
 from core.registry import load_all
 from api.accounts import router as accounts_router
 from api.tasks import router as tasks_router
@@ -62,7 +62,16 @@ def _print_runtime_info() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _print_runtime_info()
+    from core.file_logging import configure_file_logging
+    configure_file_logging()
     init_db()
+    if DATABASE_BACKEND == "sqlite":
+        # SQLite WAL is safe for the supported 40 network workers only when a
+        # single application process owns the database file.  Multiple web
+        # workers have independent locks and can otherwise starve each other.
+        configured_workers = int(os.getenv("WEB_CONCURRENCY", "1") or 1)
+        if configured_workers != 1:
+            raise RuntimeError("SQLite 模式必须设置 WEB_CONCURRENCY=1；200 并发请使用 PostgreSQL")
     load_all()
     print("[OK] 数据库初始化完成")
     from core.registry import list_platforms
@@ -71,11 +80,17 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     from services.solver_manager import start_async
     start_async()
+    from services.sms_refund_watchdog import start_sms_refund_watchdog
+    start_sms_refund_watchdog()
     yield
+    from services.sms_refund_watchdog import stop_sms_refund_watchdog
+    stop_sms_refund_watchdog()
     from core.scheduler import scheduler as _scheduler
     _scheduler.stop()
     from services.solver_manager import stop
     stop()
+    from core.file_logging import shutdown_file_logging
+    shutdown_file_logging()
 
 
 app = FastAPI(title="any-auto-register", version="1.0.0", lifespan=lifespan)
@@ -129,6 +144,15 @@ app.include_router(sms_router, prefix="/api")
 app.include_router(payments_router, prefix="/api")
 # 隐私邮箱的免登录邮件页，不带 /api 前缀就绕开了鉴权中间件
 app.include_router(shared_mail_router)
+
+
+@app.get("/health/sms-refunds", include_in_schema=False)
+def sms_refund_healthcheck():
+    """Unauthenticated container/orchestrator health probe; exposes no secrets."""
+    from services.sms_refund_watchdog import refund_status
+    from services.sms_service import resolve_sms_settings
+    payload = refund_status(resolve_sms_settings())
+    return JSONResponse(status_code=200 if payload["healthy"] else 503, content=payload)
 
 
 @app.get("/api/solver/status")

@@ -5,7 +5,7 @@ from sqlmodel import Session, select
 from typing import Callable, Optional
 from copy import deepcopy
 from datetime import datetime, timezone
-from core.db import DATABASE_REGISTER_CONCURRENCY_CAP, TaskLog, TaskRunModel, engine
+from core.db import DATABASE_REGISTER_CONCURRENCY_CAP, engine
 from core.task_runtime import (
     AttemptOutcome,
     AttemptResult,
@@ -279,81 +279,14 @@ def _normalize_snapshot(snapshot: dict) -> dict:
     }
 
 
-def _task_run_to_snapshot(row: TaskRunModel) -> dict:
-    return _normalize_snapshot(
-        {
-            "id": row.id,
-            "status": row.status,
-            "platform": row.platform,
-            "source": row.source,
-            "meta": _json_loads(row.meta_json, {}),
-            "total": row.total,
-            "progress": row.progress,
-            "logs": _json_loads(row.logs_json, []),
-            "success": row.success,
-            "registered": row.registered,
-            "skipped": row.skipped,
-            "errors": _json_loads(row.errors_json, []),
-            "control": _json_loads(row.control_json, {}),
-            "cashier_urls": _json_loads(row.cashier_urls_json, []),
-            "error": row.error,
-            "created_at": row.created_at,
-            "updated_at": row.updated_at,
-        }
-    )
-
-
 def _upsert_task_run(snapshot: dict) -> None:
-    normalized = _normalize_snapshot(snapshot)
-    if not normalized["id"]:
-        return
-    with Session(engine) as s:
-        row = s.get(TaskRunModel, normalized["id"])
-        if row is None:
-            row = TaskRunModel(
-                id=normalized["id"],
-                platform=normalized["platform"],
-                source=normalized["source"],
-                status=normalized["status"],
-                total=normalized["total"],
-                progress=normalized["progress"],
-                success=normalized["success"],
-                registered=normalized["registered"],
-                skipped=normalized["skipped"],
-                error=normalized["error"],
-                meta_json=_json_dumps(normalized["meta"], {}),
-                logs_json=_json_dumps(normalized["logs"], []),
-                errors_json=_json_dumps(normalized["errors"], []),
-                cashier_urls_json=_json_dumps(normalized["cashier_urls"], []),
-                control_json=_json_dumps(normalized["control"], {}),
-                created_at=_to_datetime(normalized["created_at"]),
-                updated_at=_to_datetime(normalized["updated_at"]),
-            )
-            s.add(row)
-        else:
-            row.platform = normalized["platform"]
-            row.source = normalized["source"]
-            row.status = normalized["status"]
-            row.total = normalized["total"]
-            row.progress = normalized["progress"]
-            row.success = normalized["success"]
-            row.registered = normalized["registered"]
-            row.skipped = normalized["skipped"]
-            row.error = normalized["error"]
-            row.meta_json = _json_dumps(normalized["meta"], {})
-            row.logs_json = _json_dumps(normalized["logs"], [])
-            row.errors_json = _json_dumps(normalized["errors"], [])
-            row.cashier_urls_json = _json_dumps(normalized["cashier_urls"], [])
-            row.control_json = _json_dumps(normalized["control"], {})
-            if row.created_at is None:
-                row.created_at = _to_datetime(normalized["created_at"])
-            row.updated_at = _to_datetime(normalized["updated_at"])
-            s.add(row)
-        s.commit()
+    """Compatibility name: task UI history is file-backed, never DB-backed."""
+    from core.task_history_store import save_task
+    save_task(_normalize_snapshot(snapshot))
 
 
-# 日志、进度会被高并发 worker 频繁更新；合并为最多每秒一次的快照写入，
-# 任务结束或读取详情时可用 force=True 强制落库。
+# High-concurrency task snapshots intentionally live in task_history.json so
+# their frequent updates cannot contend with account/activation database writes.
 _TASK_SNAPSHOT_FLUSH_INTERVAL_SECONDS = 1.0
 _snapshot_flush_lock = threading.Lock()
 _snapshot_last_flush_at: dict[str, float] = {}
@@ -367,65 +300,35 @@ def _persist_task_snapshot(task_id: str, *, force: bool = False) -> None:
         last_flush_at = _snapshot_last_flush_at.get(task_id, 0.0)
         if not force and now - last_flush_at < _TASK_SNAPSHOT_FLUSH_INTERVAL_SECONDS:
             return
-        # 先占位，避免 200 个 worker 同时穿透节流并重复写同一条 task_runs。
         _snapshot_last_flush_at[task_id] = now
     try:
-        snapshot = _task_store.snapshot(task_id)
-        _upsert_task_run(snapshot)
+        _upsert_task_run(_task_store.snapshot(task_id))
     except Exception:
-        # 允许下一次调用尽快重试，不把短暂数据库故障缓存一秒。
         with _snapshot_flush_lock:
             _snapshot_last_flush_at.pop(task_id, None)
 
 
 def _get_persisted_task(task_id: str) -> Optional[dict]:
-    with Session(engine) as s:
-        row = s.get(TaskRunModel, task_id)
-        if row is None:
-            return None
-        return _task_run_to_snapshot(row)
+    from core.task_history_store import get_task
+    value = get_task(task_id)
+    return _normalize_snapshot(value) if value else None
 
 
 def _list_persisted_tasks() -> list[dict]:
-    with Session(engine) as s:
-        rows = s.exec(select(TaskRunModel)).all()
-    snapshots = [_task_run_to_snapshot(row) for row in rows]
-    snapshots.sort(
-        key=lambda item: (
-            {"running": 0, "pending": 1, "done": 2, "failed": 3, "stopped": 4}.get(
-                str(item.get("status") or ""),
-                9,
-            ),
-            -_to_epoch_seconds(item.get("created_at")),
-        )
-    )
+    from core.task_history_store import list_tasks
+    snapshots = [_normalize_snapshot(item) for item in list_tasks()]
+    snapshots.sort(key=lambda item: (
+        {"running": 0, "pending": 1, "done": 2, "failed": 3, "stopped": 4}.get(str(item.get("status") or ""), 9),
+        -_to_epoch_seconds(item.get("created_at")),
+    ))
     return snapshots
 
 
 def _finalize_orphan_tasks() -> None:
-    with Session(engine) as s:
-        rows = s.exec(
-            select(TaskRunModel).where(TaskRunModel.status.in_(["pending", "running"]))
-        ).all()
-        if not rows:
-            return
-        changed = False
-        for row in rows:
-            if _task_store.exists(row.id):
-                continue
-            row.status = "stopped"
-            row.error = row.error or "任务因服务重启中断"
-            logs = _json_loads(row.logs_json, [])
-            tip = "[SYSTEM] 任务因服务重启中断，已自动标记为已停止"
-            if tip not in logs:
-                ts = datetime.now().strftime("%H:%M:%S")
-                logs.append(f"[{ts}] {tip}")
-            row.logs_json = _json_dumps(logs, [])
-            row.updated_at = _utcnow()
-            s.add(row)
-            changed = True
-        if changed:
-            s.commit()
+    # File history has no cross-process locking semantics. A missing in-memory
+    # task after restart is shown as its last saved state instead of writing to
+    # the account database or fabricating an unsafe state transition.
+    return None
 
 
 def _ensure_task_exists(task_id: str) -> None:
@@ -536,24 +439,17 @@ def _log(task_id: str, msg: str):
     entry = f"[{ts}] {msg}"
     _task_store.append_log(task_id, entry)
     _persist_task_snapshot(task_id)
-    print(entry)
+    # Goes to the bounded application log shards configured at startup.
+    logger.info("[task=%s] %s", task_id, msg)
 
 
 def _save_task_log(
     platform: str, email: str, status: str, error: str = "", detail: dict = None
 ):
-    """Write a TaskLog record to the database (fire-and-forget, non-blocking)."""
+    """Append task history to task_history.json without touching the database."""
+    from core.task_history_store import append_log
     def _write():
-        with Session(engine) as s:
-            log = TaskLog(
-                platform=platform,
-                email=email,
-                status=status,
-                error=error,
-                detail_json=json.dumps(detail or {}, ensure_ascii=False),
-            )
-            s.add(log)
-            s.commit()
+        append_log(platform=platform, email=email, status=status, error=error, detail=detail)
     threading.Thread(target=_write, daemon=True).start()
 
 
@@ -983,6 +879,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         _log(task_id, f"[SYSTEM] {level}: active_attempts={active}，"
                              f"最长无心跳 {stale}s，阶段={state.get('attempt_stage_counts') or {}}")
                         last_stall_notice_at = now
+                    # A quiet child can keep running without emitting logs. Flush
+                    # its current control snapshot once per second so persisted
+                    # task lists do not freeze at the last progress event.
+                    _persist_task_snapshot(task_id)
                     continue
                 for future in done:
                     try:
@@ -1624,13 +1524,9 @@ def stop_task(task_id: str):
 
 @router.get("/logs")
 def get_logs(platform: str = None, page: int = 1, page_size: int = 50):
-    with Session(engine) as s:
-        q = select(TaskLog)
-        if platform:
-            q = q.where(TaskLog.platform == platform)
-        q = q.order_by(TaskLog.id.desc())
-        total = len(s.exec(q).all())
-        items = s.exec(q.offset((page - 1) * page_size).limit(page_size)).all()
+    from core.task_history_store import list_logs
+    page, page_size = max(1, page), max(1, min(page_size, 200))
+    total, items = list_logs(platform, page, page_size)
     return {"total": total, "items": items}
 
 
@@ -1638,33 +1534,12 @@ def get_logs(platform: str = None, page: int = 1, page_size: int = 50):
 def batch_delete_logs(body: TaskLogBatchDeleteRequest):
     if not body.ids:
         raise HTTPException(400, "任务历史 ID 列表不能为空")
-
     unique_ids = list(dict.fromkeys(body.ids))
     if len(unique_ids) > 1000:
         raise HTTPException(400, "单次最多删除 1000 条任务历史")
-
-    with Session(engine) as s:
-        try:
-            logs = s.exec(select(TaskLog).where(TaskLog.id.in_(unique_ids))).all()
-            found_ids = {log.id for log in logs if log.id is not None}
-
-            for log in logs:
-                s.delete(log)
-
-            s.commit()
-            deleted_count = len(found_ids)
-            not_found_ids = [log_id for log_id in unique_ids if log_id not in found_ids]
-            logger.info("批量删除任务历史成功: %s 条", deleted_count)
-
-            return {
-                "deleted": deleted_count,
-                "not_found": not_found_ids,
-                "total_requested": len(unique_ids),
-            }
-        except Exception as e:
-            s.rollback()
-            logger.exception("批量删除任务历史失败")
-            raise HTTPException(500, f"批量删除任务历史失败: {str(e)}")
+    from core.task_history_store import delete_logs
+    deleted_count, not_found_ids = delete_logs(unique_ids)
+    return {"deleted": deleted_count, "not_found": not_found_ids, "total_requested": len(unique_ids)}
 
 
 @router.get("/{task_id}/logs/stream")
@@ -1721,8 +1596,26 @@ def get_task(task_id: str):
 @router.get("")
 def list_tasks():
     _finalize_orphan_tasks()
-    # 以 DB 为主返回，避免进程重启导致列表丢失
-    return _list_persisted_tasks()
+    # DB preserves history across restart, but it is deliberately flushed at a
+    # bounded rate. Overlay in-memory running tasks so heartbeat/stall state is
+    # live even during a quiet 200-worker interval.
+    persisted = {item["id"]: item for item in _list_persisted_tasks()}
+    # list_snapshots takes one store lock, unlike a hypothetical ids()+snapshot()
+    # pair which could race task cleanup between calls.
+    live_snapshots = _task_store.list_snapshots()
+    for raw_snapshot in live_snapshots:
+        snapshot = _normalize_snapshot(raw_snapshot)
+        task_id = snapshot["id"]
+        if not task_id:
+            continue
+        persisted[task_id] = snapshot
+        _persist_task_snapshot(task_id)
+    snapshots = list(persisted.values())
+    snapshots.sort(key=lambda item: (
+        {"running": 0, "pending": 1, "done": 2, "failed": 3, "stopped": 4}.get(item.get("status"), 9),
+        -float(item.get("created_at") or 0),
+    ))
+    return snapshots
 
 
 @router.delete("/{task_id}")
@@ -1732,9 +1625,6 @@ def delete_task(task_id: str):
     status = str(snapshot.get("status") or "")
     if status in {"pending", "running"}:
         raise HTTPException(409, "运行中的任务不允许删除，请先停止任务")
-    with Session(engine) as s:
-        row = s.get(TaskRunModel, task_id)
-        if row is not None:
-            s.delete(row)
-            s.commit()
+    from core.task_history_store import delete_task
+    delete_task(task_id)
     return {"ok": True, "task_id": task_id}

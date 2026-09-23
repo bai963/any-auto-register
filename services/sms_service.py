@@ -24,13 +24,17 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from core.db import DATABASE_REGISTER_CONCURRENCY_CAP
+from core.db import (
+    DATABASE_BACKEND, DATABASE_REGISTER_CONCURRENCY_CAP, SmsActivationModel,
+    SmsCleanupJobModel, database_write_session, engine,
+)
 import requests
 
 logger = logging.getLogger(__name__)
@@ -39,6 +43,12 @@ SMS_DEFAULT_SERVICE = "dr"
 SMS_DEFAULT_COUNTRY = "52"  # 泰国 —— OpenAI 走纯 SMS 的稳定国家
 # 从接码平台成功租到号码起算；超过此期限仍未收到验证码就必须取消并申请退款。
 SMS_WAIT_TIMEOUT_SECONDS = 240
+# No successful send: refund after ten minutes from rental. Successful send:
+# refund after four minutes without a code.
+SMS_ACTIVATION_MAX_LIFETIME_SECONDS = 600
+SMS_CODE_WAIT_AFTER_SEND_SECONDS = 240
+SMS_REFUND_SCAN_INTERVAL_SECONDS = 5
+SMS_REFUND_LEASE_SECONDS = 45
 SMS_HTTP_TIMEOUT = (5, 15)  # connect, read；任何接码 HTTP 都不能无限阻塞
 
 # OpenAI 走纯 SMS 的国家白名单（截至 2025-2026 实测；其它国家会抽到 WhatsApp 号）
@@ -144,6 +154,9 @@ class BaseSmsProvider(ABC):
             (reason or "业务验证完成")[:80],
         )
         if ok:
+            complete = getattr(self, "_db_complete", None)
+            if callable(complete):
+                complete(activation_id, "finished")
             forget = getattr(self, "_forget_activation", None)
             if callable(forget):
                 forget(activation_id)
@@ -221,6 +234,10 @@ def country_label(country_id) -> str:
 
 def _hash_secret(value: str) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _safe_int(value, default: int) -> int:
@@ -366,33 +383,110 @@ class SmsActivateProvider(BaseSmsProvider):
         self._used_codes: dict[str, set[str]] = {}
         self.current_activation: Optional[SmsActivation] = None
         self._warned_low_bid = False
-        # 进程重启后继续处理上次未完成的 cancel / finish，避免 activation 只等平台自然过期。
-        self._recover_activation_journal()
-        self._retry_pending_cleanup()
+        # Database-backed cleanup jobs are the only runtime source of truth.
+        # Legacy JSON is imported once during application startup, never replayed
+        # by individual provider instances.
 
     def _cleanup_identity(self) -> str:
         return _hash_secret(f"{self.base_url}|{self.api_key}")
 
     def _enqueue_cleanup(self, activation_id: str, action: str, reason: str) -> None:
-        """将失败的结算/退款写入本地队列，后续启动或下次使用接码时自动重试。"""
-        with _SMS_CLEANUP_LOCK:
-            items = _load_cleanup_queue()
-            key = (self._cleanup_identity(), str(activation_id), action)
-            for item in items:
-                if (item.get("provider"), item.get("activation_id"), item.get("action")) == key:
-                    item["reason"] = reason[:300]
-                    item["updated_at"] = time.time()
-                    item["next_retry_at"] = min(float(item.get("next_retry_at") or time.time()), time.time())
-                    _save_cleanup_queue(items)
-                    return
-            items.append({
-                "provider": key[0], "activation_id": key[1], "action": action,
-                "reason": reason[:300], "attempts": 0, "created_at": time.time(),
-                "updated_at": time.time(), "next_retry_at": time.time(),
-            })
-            _save_cleanup_queue(items)
-        logger.warning("接码清理已进入重试队列: activation_id=%s action=%s", activation_id, action)
+        """Persist cleanup work in the database; no JSON queue is used at runtime."""
+        now = _utcnow()
+        with database_write_session() as session:
+            activation = session.query(SmsActivationModel).filter_by(
+                provider_identity=self._cleanup_identity(), activation_id=str(activation_id)
+            ).first()
+            if activation is None:
+                # A provider response may have succeeded immediately before an old
+                # process was upgraded. Keep a durable placeholder rather than
+                # dropping its refund request.
+                activation = SmsActivationModel(
+                    provider_identity=self._cleanup_identity(), activation_id=str(activation_id),
+                    state="refund_pending" if action == "cancel" else "finish_pending",
+                    rented_at=now,
+                    activation_deadline_at=now,
+                    created_at=now, updated_at=now,
+                )
+                session.add(activation)
+                session.flush()
+            existing = session.query(SmsCleanupJobModel).filter_by(
+                activation_db_id=activation.id, action=action
+            ).first()
+            if existing is None:
+                session.add(SmsCleanupJobModel(
+                    activation_db_id=activation.id, action=action, status="pending",
+                    next_retry_at=now, reason=reason[:300], created_at=now, updated_at=now,
+                ))
+            else:
+                existing.reason = reason[:300]
+                existing.next_retry_at = min(existing.next_retry_at, now)
+                existing.updated_at = now
+                session.add(existing)
+            session.commit()
+        logger.warning("接码清理已进入数据库重试队列: activation_id=%s action=%s", activation_id, action)
 
+    def _db_upsert_activation(self, activation: SmsActivation, state: str = "rented") -> None:
+        """Persist before returning the phone: a child crash must not lose a billable activation."""
+        now = _utcnow()
+        identity = self._cleanup_identity()
+        with database_write_session() as session:
+            existing = session.query(SmsActivationModel).filter_by(
+                provider_identity=identity, activation_id=str(activation.activation_id)
+            ).first()
+            if existing is None:
+                session.add(SmsActivationModel(
+                    provider_identity=identity, activation_id=str(activation.activation_id),
+                    phone_number=activation.phone_number, country=activation.country, state=state,
+                    rented_at=now,
+                    activation_deadline_at=now + timedelta(seconds=SMS_ACTIVATION_MAX_LIFETIME_SECONDS),
+                    created_at=now, updated_at=now,
+                ))
+                session.commit()
+
+    def _db_mark_sms_sent(self, activation_id: str) -> bool:
+        """Set the four-minute deadline once; duplicate callbacks must not extend it."""
+        now = _utcnow()
+        identity = self._cleanup_identity()
+        with database_write_session() as session:
+            row = session.query(SmsActivationModel).filter_by(
+                provider_identity=identity, activation_id=str(activation_id)
+            ).first()
+            if row is None or row.state not in {"rented", "send_requested"} or row.sms_sent_at:
+                return False
+            row.state = "sms_sent"
+            row.sms_sent_at = now
+            row.code_deadline_at = now + timedelta(seconds=SMS_CODE_WAIT_AFTER_SEND_SECONDS)
+            row.updated_at = now
+            row.version += 1
+            session.add(row)
+            session.commit()
+            return True
+
+    def _db_mark_otp_received(self, activation_id: str) -> bool:
+        now = _utcnow()
+        with database_write_session() as session:
+            row = session.query(SmsActivationModel).filter_by(
+                provider_identity=self._cleanup_identity(), activation_id=str(activation_id)
+            ).first()
+            if row is None or row.state != "sms_sent":
+                return False
+            row.state, row.otp_received_at, row.updated_at, row.version = "otp_received", now, now, row.version + 1
+            session.add(row)
+            session.commit()
+            return True
+
+    def _db_complete(self, activation_id: str, state: str) -> None:
+        now = _utcnow()
+        with database_write_session() as session:
+            row = session.query(SmsActivationModel).filter_by(
+                provider_identity=self._cleanup_identity(), activation_id=str(activation_id)
+            ).first()
+            if row:
+                row.state, row.updated_at, row.version = state, now, row.version + 1
+                if state == "refunded": row.refunded_at = now
+                if state == "finished": row.finished_at = now
+                session.add(row); session.commit()
     def _track_activation(self, activation: SmsActivation, state: str = "rented") -> None:
         with _SMS_CLEANUP_LOCK:
             items = _load_activation_journal()
@@ -438,61 +532,8 @@ class SmsActivateProvider(BaseSmsProvider):
             self._forget_activation(str(item.get("activation_id") or ""))
 
     def _retry_pending_cleanup(self) -> None:
-        """处理遗留 activation；网络 I/O 必须在 cleanup 锁外。
-
-        上次卡死时，40 个手机号 worker 在有 cancel 遗留项后同时静默。这里绝不能
-        持有 ``_SMS_CLEANUP_LOCK`` 调供应商 API，否则一个慢请求会堵住所有新 worker。
-        """
-        identity = self._cleanup_identity()
-        now = time.time()
-        with _SMS_CLEANUP_LOCK:
-            items = _load_cleanup_queue()
-            claimed: list[dict] = []
-            for item in items:
-                if len(claimed) >= 20 or item.get("provider") != identity:
-                    continue
-                attempts = int(item.get("attempts") or 0)
-                if attempts >= 6 or float(item.get("next_retry_at") or 0) > now:
-                    continue
-                # 同进程的其它 provider 初始化时看见此值会跳过，避免重复退款。
-                item["next_retry_at"] = now + 30
-                item["updated_at"] = now
-                claimed.append(dict(item))
-            _save_cleanup_queue(items)
-
-        for claimed_item in claimed:
-            activation_id = str(claimed_item.get("activation_id") or "")
-            action = str(claimed_item.get("action") or "cancel")
-            try:
-                if action == "finish":
-                    response = self._request({"action": "finishActivation", "id": activation_id})
-                    ok = response.status_code in (200, 204) or "ACCESS" in response.text
-                else:
-                    response = self._request({"action": "setStatus", "id": activation_id, "status": 8})
-                    ok = response.status_code in (200, 204) or "ACCESS_CANCEL" in response.text
-            except Exception:
-                ok = False
-
-            with _SMS_CLEANUP_LOCK:
-                items = _load_cleanup_queue()
-                retained: list[dict] = []
-                for item in items:
-                    same = (item.get("provider") == identity and
-                            str(item.get("activation_id") or "") == activation_id and
-                            item.get("action") == action)
-                    if not same:
-                        retained.append(item)
-                        continue
-                    if ok:
-                        logger.info("接码遗留清理成功: activation_id=%s action=%s", activation_id, action)
-                        continue
-                    attempts = int(item.get("attempts") or 0) + 1
-                    item["attempts"] = attempts
-                    item["updated_at"] = time.time()
-                    retry_delays = (10, 30, 120, 600, 1800, 3600)
-                    item["next_retry_at"] = time.time() + retry_delays[min(attempts - 1, len(retry_delays) - 1)]
-                    retained.append(item)
-                _save_cleanup_queue(retained)
+        """Compatibility no-op. Cleanup retries are run by sms_refund_watchdog."""
+        return None
 
     # ── HTTP ──
 
@@ -742,6 +783,7 @@ class SmsActivateProvider(BaseSmsProvider):
                     metadata={},
                 )
                 self.current_activation = activation
+                self._db_upsert_activation(activation, "rented")
                 self._track_activation(activation, "rented")
                 if len(country_candidates) > 1:
                     logger.info("在国家 %s 租到号 %s (action=%s)", cid, phone, action)
@@ -874,6 +916,8 @@ class SmsActivateProvider(BaseSmsProvider):
                 if result.get("status") == "ok":
                     code = str(result.get("code") or "")
                     if code and code not in used_codes:
+                        self._db_mark_otp_received(activation_id)
+                        self._set_activation_state(activation_id, "otp_received")
                         return {
                             "status": "ok",
                             "code": code,
@@ -931,6 +975,7 @@ class SmsActivateProvider(BaseSmsProvider):
                 pass
         self._used_codes.pop(str(activation_id), None)
         if ok:
+            self._db_complete(activation_id, "refunded")
             self._forget_activation(activation_id)
         else:
             self._enqueue_cleanup(activation_id, "cancel", "取消未使用号码")
@@ -965,34 +1010,21 @@ class SmsActivateProvider(BaseSmsProvider):
 
 
 def cancel_expired_sms_activations(config: dict, *, proxy: Optional[str] = None) -> int:
-    """父 watchdog 杀掉卡死注册子进程后，补偿其超过 4 分钟的未收码号码。
+    """Compatibility entry point for parent task watchdogs.
 
-    activation journal 是跨进程的事实来源；只取消仍未收到/提交验证码的号码。
-    网络请求由 provider 在 cleanup 锁外完成，失败会进入持久化重试队列。
+    Deadline ownership moved to the database scheduler.  Keeping this function
+    lets existing callers trigger an immediate *database* scan without reading
+    the retired JSON journal or making unbounded cancel calls in task threads.
     """
     settings = dict(config or {})
     if proxy and not settings.get("sms_proxy"):
         settings["sms_proxy"] = proxy
-    key = str(settings.get("sms_provider") or "smsbower")
     try:
-        provider = create_sms_provider(key, settings)
+        from services.sms_refund_watchdog import schedule_due_refunds
+        return schedule_due_refunds(settings)
     except Exception:
-        logger.warning("watchdog 无法初始化接码 provider，保留 activation 待下次恢复", exc_info=True)
+        logger.warning("扫描超时接码 activation 失败", exc_info=True)
         return 0
-    identity = provider._cleanup_identity() if isinstance(provider, SmsActivateProvider) else ""
-    now = time.time()
-    with _SMS_CLEANUP_LOCK:
-        items = _load_activation_journal()
-        expired = [
-            str(item.get("activation_id") or activation_id)
-            for activation_id, item in items.items()
-            if item.get("provider") == identity
-            and float(item.get("sms_deadline_at") or 0) <= now
-            and str(item.get("state") or "rented") in {"rented", "sms_sent", "waiting_code"}
-        ]
-    for activation_id in expired:
-        provider.cancel(activation_id)
-    return len(expired)
 
 
 def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
@@ -1098,7 +1130,9 @@ class PhoneCallbackController:
     def _resolve_country_candidates(self, provider: BaseSmsProvider) -> list[str]:
         """只按价格上限从全平台当前有库存的国家中自动租号。"""
         if not isinstance(provider, SmsActivateProvider):
-            return [SMS_DEFAULT_COUNTRY]
+            return [self.country or SMS_DEFAULT_COUNTRY]
+        if not self.auto_select_country:
+            return [self.country or SMS_DEFAULT_COUNTRY]
 
         price_cap = _safe_float(
             self.config.get("sms_max_price") or self.config.get("sms_auto_max_price"),

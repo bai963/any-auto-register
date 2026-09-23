@@ -68,3 +68,20 @@ python main.py
 ```
 
 连接失败或 URL 不是 SQLite/PostgreSQL 时，应用会在启动阶段报出明确错误，不会悄悄回退到其他数据库。
+
+
+## 接码退款高并发运行基线
+
+- **PostgreSQL**：注册总并发上限 200。推荐 `DB_POOL_SIZE=30`、
+  `DB_MAX_OVERFLOW=30`、`DB_POOL_TIMEOUT=10`；退款 worker 25 个。若启动多个
+  应用容器，须确保 PostgreSQL `max_connections` 至少覆盖所有实例连接池之和及管理余量。
+- **SQLite**：注册总并发上限 40，且必须只启动一个应用进程
+  （`WEB_CONCURRENCY=1`）。SQLite WAL 只能有一个 writer，不能通过多容器或多个
+  Uvicorn worker 扩容。
+- 部署后的健康探针为 `GET /health/sms-refunds`。HTTP 200 表示退款队列健康；HTTP 503
+  表示存在到期未入队 activation、过期 lease、超过阈值的积压任务。完整诊断可通过已认证
+  的 `GET /api/sms/refunds/status` 查询，手动执行一轮有边界的回收使用
+  `POST /api/sms/refunds/retry`。
+
+推荐灰度步骤：先以 PostgreSQL 20 注册并发运行并观察退款健康接口和供应商 429，再逐步
+提升至 200；SQLite 不要超过 40。不要用真实接码供应商做 200 并发压测。

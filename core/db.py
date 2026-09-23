@@ -4,9 +4,12 @@ import os
 import secrets
 from typing import Optional
 from sqlmodel import Field, SQLModel, create_engine, Session, select
-from sqlalchemy import event
+from sqlalchemy import event, Index
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
+from sqlalchemy.pool import QueuePool
+from contextlib import contextmanager
+import threading
 import json
 
 
@@ -30,7 +33,12 @@ except ArgumentError as exc:
 _database_backend = _database_url.get_backend_name()
 # 注册 worker 的硬上限随数据库的并发写入能力而定。不要仅依赖调用方的
 # concurrency 参数，否则 SQLite 会被误配成 200 个并发写入者。
-DATABASE_REGISTER_CONCURRENCY_CAP = 200 if _database_backend == "postgresql" else 40
+DATABASE_BACKEND = _database_backend
+POSTGRES_REGISTER_CONCURRENCY = 200
+SQLITE_REGISTER_CONCURRENCY = 40
+DATABASE_REGISTER_CONCURRENCY_CAP = (
+    POSTGRES_REGISTER_CONCURRENCY if _database_backend == "postgresql" else SQLITE_REGISTER_CONCURRENCY
+)
 if _database_backend not in {"sqlite", "postgresql"}:
     raise RuntimeError(
         f"不支持的数据库类型: {_database_backend}。当前仅支持 SQLite 和 PostgreSQL。"
@@ -49,12 +57,18 @@ def _read_positive_int_env(name: str, default: int) -> int:
 _engine_options = (
     {
         "pool_pre_ping": True,
-        "pool_size": _read_positive_int_env("DB_POOL_SIZE", 50),
-        "max_overflow": _read_positive_int_env("DB_MAX_OVERFLOW", 100),
-        "pool_timeout": _read_positive_int_env("DB_POOL_TIMEOUT", 30),
+        "pool_size": _read_positive_int_env("DB_POOL_SIZE", 30),
+        "max_overflow": _read_positive_int_env("DB_MAX_OVERFLOW", 30),
+        "pool_timeout": _read_positive_int_env("DB_POOL_TIMEOUT", 10),
     }
     if _database_backend == "postgresql"
-    else {"connect_args": {"check_same_thread": False, "timeout": 30}}
+    else {
+        "poolclass": QueuePool,
+        "pool_size": _read_positive_int_env("SQLITE_DB_POOL_SIZE", 8),
+        "max_overflow": 0,
+        "pool_timeout": _read_positive_int_env("SQLITE_DB_POOL_TIMEOUT", 10),
+        "connect_args": {"check_same_thread": False, "timeout": 30},
+    }
 )
 engine = create_engine(DATABASE_URL, **_engine_options)
 
@@ -70,10 +84,75 @@ if _database_backend == "sqlite":
             cursor.execute("PRAGMA busy_timeout=30000")
             # WAL 文件过大时 checkpoint 会拖慢所有写者；该阈值适合本地 40 worker。
             cursor.execute("PRAGMA wal_autocheckpoint=1000")
+            cursor.execute("PRAGMA journal_size_limit=67108864")
             cursor.execute("PRAGMA foreign_keys=ON")
         finally:
             cursor.close()
 
+
+# SQLite allows concurrent readers in WAL mode but has exactly one writer.  This
+# gate serializes *short* local write transactions only; never do network I/O
+# while holding it. PostgreSQL keeps normal row-level write concurrency.
+_sqlite_write_lock = threading.RLock()
+
+@contextmanager
+def database_write_session():
+    if DATABASE_BACKEND == "sqlite":
+        with _sqlite_write_lock:
+            with Session(engine) as session:
+                yield session
+    else:
+        with Session(engine) as session:
+            yield session
+
+
+class SmsActivationModel(SQLModel, table=True):
+    """Durable SMS activation state shared by workers, watchdogs and children."""
+    __tablename__ = "sms_activations"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider_identity: str = Field(index=True, max_length=128)
+    activation_id: str = Field(max_length=128)
+    phone_number: str = Field(default="", max_length=64)
+    country: str = Field(default="", max_length=32)
+    state: str = Field(default="rented", index=True, max_length=32)
+    rented_at: datetime = Field(default_factory=_utcnow, index=True)
+    activation_deadline_at: datetime = Field(index=True)
+    send_request_started_at: Optional[datetime] = Field(default=None)
+    sms_sent_at: Optional[datetime] = Field(default=None)
+    code_deadline_at: Optional[datetime] = Field(default=None, index=True)
+    otp_received_at: Optional[datetime] = Field(default=None)
+    otp_submitted_at: Optional[datetime] = Field(default=None)
+    refund_requested_at: Optional[datetime] = Field(default=None)
+    refunded_at: Optional[datetime] = Field(default=None)
+    finished_at: Optional[datetime] = Field(default=None)
+    version: int = Field(default=1, nullable=False)
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class SmsCleanupJobModel(SQLModel, table=True):
+    __tablename__ = "sms_cleanup_jobs"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    activation_db_id: int = Field(index=True)
+    action: str = Field(max_length=16)
+    status: str = Field(default="pending", index=True, max_length=16)
+    attempts: int = Field(default=0)
+    lease_owner: str = Field(default="", max_length=128)
+    lease_until: Optional[datetime] = Field(default=None, index=True)
+    next_retry_at: datetime = Field(default_factory=_utcnow, index=True)
+    reason: str = Field(default="", max_length=300)
+    last_error: str = Field(default="", max_length=500)
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+Index("uq_sms_activation_provider_activation", SmsActivationModel.provider_identity, SmsActivationModel.activation_id, unique=True)
+Index("ix_sms_activation_refund_scan", SmsActivationModel.state, SmsActivationModel.activation_deadline_at)
+Index("ix_sms_activation_code_refund_scan", SmsActivationModel.state, SmsActivationModel.code_deadline_at)
+Index("uq_sms_cleanup_job_activation_action", SmsCleanupJobModel.activation_db_id, SmsCleanupJobModel.action, unique=True)
+Index("ix_sms_cleanup_job_claim", SmsCleanupJobModel.status, SmsCleanupJobModel.next_retry_at, SmsCleanupJobModel.lease_until)
 
 class AccountModel(SQLModel, table=True):
     __tablename__ = "accounts"

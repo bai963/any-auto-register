@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from services.sms_service import (
@@ -113,3 +114,29 @@ def get_sms_countries(body: SmsProbeRequest):
             for row in rows[:limit]
         ],
     }
+
+
+@router.get("/refunds/status")
+def get_sms_refund_status():
+    """Operational snapshot: queue backlog, abandoned leases and active limits."""
+    from services.sms_refund_watchdog import refund_status
+    return refund_status(resolve_sms_settings())
+
+
+@router.post("/refunds/retry")
+def retry_sms_refunds():
+    """Trigger one bounded scheduler/worker pass; never performs unbounded work."""
+    from services.sms_refund_watchdog import run_once, refund_status
+    settings = resolve_sms_settings()
+    if not settings.get("sms_enabled") or not str(settings.get("sms_api_key") or "").strip():
+        raise HTTPException(status_code=400, detail="SMS 接码未启用或未配置 API Key")
+    run_once(settings)
+    return refund_status(settings)
+
+
+@router.get("/refunds/health")
+def get_sms_refund_health():
+    """Machine-readable readiness endpoint; unhealthy means human action is needed."""
+    from services.sms_refund_watchdog import refund_status
+    payload = refund_status(resolve_sms_settings())
+    return JSONResponse(status_code=200 if payload["healthy"] else 503, content=payload)

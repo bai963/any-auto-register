@@ -44,6 +44,7 @@ interface TaskSnapshot {
     stop_requested: boolean
     active_attempts?: number
     oldest_attempt_heartbeat_seconds?: number
+    heartbeat_observed_at?: number
     attempt_stage_counts?: Record<string, number>
   }
 }
@@ -175,7 +176,13 @@ export default function RunningTasks() {
       ? formatDuration(task.created_at, now)
       : formatDuration(task.created_at, task.updated_at)
     const activeAttempts = Number(task.control?.active_attempts || 0)
-    const staleSeconds = Number(task.control?.oldest_attempt_heartbeat_seconds || 0)
+    const persistedStaleSeconds = Number(task.control?.oldest_attempt_heartbeat_seconds || 0)
+    const heartbeatObservedAt = toUnixSeconds(task.control?.heartbeat_observed_at) || now
+    // The browser ticks each second, so warning badges continue advancing even
+    // if a quiet worker has not produced a new task log or DB flush yet.
+    const staleSeconds = Math.max(0, Math.floor(
+      persistedStaleSeconds + Math.max(0, now - heartbeatObservedAt),
+    ))
     const stages = task.control?.attempt_stage_counts || {}
     const stageSummary = Object.entries(stages).map(([stage, count]) => `${stage}×${count}`).join('，')
     const stalled = isActive(task) && activeAttempts > 0 && staleSeconds >= 60
