@@ -655,7 +655,11 @@ class AuthFlow(PhoneRegisterMixin):
         """
         current = start_url
         callback_url = ""
-        chose_account = False  # /choose-an-account 每条链路只选一次，防 200/同 URL 循环
+        # A selector can reply 200 with only a Set-Cookie. Verify the next GET
+        # has actually left the page; allow one bounded reselect if it has not.
+        choose_account_attempts = 0
+        max_choose_account_attempts = 2
+        last_choose_account_url = ""
         for i in range(12):
             if self._callback_has_code(current, redirect_uri):
                 callback_url = current
@@ -692,14 +696,23 @@ class AuthFlow(PhoneRegisterMixin):
                 # /choose-an-account：OpenAI 已登录多账号的选择页（react-router SSR）。
                 # HTML 里 streamController.enqueue 注入 unified_sessions[].id (us_*) 和
                 # authsess_*。protocol 端要主动选第一个 us_*，否则 codex callback 拿不到。
-                if "/choose-an-account" in current and not chose_account:
-                    chose_account = True
-                    next_url = self._choose_account_select(resp.text or "", current)
-                    if next_url:
-                        if next_url.startswith("/"):
-                            next_url = urljoin("https://auth.openai.com", next_url)
-                        current = next_url
-                        continue
+                if "/choose-an-account" in current:
+                    if choose_account_attempts < max_choose_account_attempts:
+                        choose_account_attempts += 1
+                        last_choose_account_url = current
+                        next_url = self._choose_account_select(resp.text or "", current)
+                        if next_url:
+                            if next_url.startswith("/"):
+                                next_url = urljoin("https://auth.openai.com", next_url)
+                            current = next_url
+                            continue
+                    else:
+                        logger.warning(
+                            "账号选择未生效：已重试 %s 次仍停留在 choose-an-account；"
+                            "可能是 session cookie 未写入或候选账号已失效",
+                            choose_account_attempts,
+                        )
+                        break
 
             if resp.status_code not in (301, 302, 303, 307, 308):
                 break
@@ -713,6 +726,12 @@ class AuthFlow(PhoneRegisterMixin):
                 current = loc
                 break
             current = loc
+        if not callback_url and choose_account_attempts and "/choose-an-account" in (current or ""):
+            logger.warning(
+                "账号选择后未进入授权回调：attempts=%s final=%s",
+                choose_account_attempts,
+                (current or last_choose_account_url)[:180],
+            )
         return callback_url, current
 
     @staticmethod
@@ -2539,6 +2558,51 @@ class AuthFlow(PhoneRegisterMixin):
         self._trace_http("workspace_select", resp)
         return resp.json().get("continue_url", "") if resp.status_code == 200 else ""
 
+    def _select_choose_account_session(self, html_text: str) -> str:
+        """Choose the unified session that most likely belongs to this flow.
+
+        The SSR payload format is intentionally treated as opaque: session IDs
+        are stable, while nearby text may contain an email or phone identifier.
+        When no trustworthy identifier is present we retain the legacy first
+        session fallback rather than refusing a valid selector page.
+        """
+        # Do not JSON-decode React Flight/SSR streams: their serialization is
+        # intentionally not a stable public contract.  Split the raw text at
+        # each us_* token instead, so identifiers from one session cannot make
+        # an adjacent session appear to match.
+        html = (html_text or "").replace(r'\\"', '"')
+        matches = list(re.finditer(r"(?<![A-Za-z0-9_])us_[A-Za-z0-9_-]{8,}", html))
+        if not matches:
+            return ""
+        result = getattr(self, "result", None)
+        identifiers = [
+            ("email", str(getattr(result, "bound_email", "") or "").strip().lower()),
+            ("email", str(getattr(result, "email", "") or "").strip().lower()),
+            ("phone", str(getattr(result, "phone_number", "") or "").strip()),
+            ("account", str(getattr(result, "account_id", "") or "").strip().lower()),
+        ]
+        identifiers = [(kind, value) for kind, value in identifiers if value]
+        candidates = [match.group(0) for match in matches]
+        if not identifiers:
+            return candidates[0]
+        segments = []
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(html)
+            segments.append(html[match.start():end].lower())
+        # Prioritize bound email, then active login identity, before the phone.
+        for kind, identifier in identifiers:
+            for candidate, segment in zip(candidates, segments):
+                if kind in {"email", "account"} and identifier in segment:
+                    logger.debug("choose-an-account 按%s匹配 session_id=%s", "邮箱" if kind == "email" else "账号", candidate)
+                    return candidate
+                if kind == "phone":
+                    phone_digits = re.sub(r"[^0-9]", "", identifier)
+                    if len(phone_digits) >= 6 and phone_digits in re.sub(r"[^0-9]", "", segment):
+                        logger.debug("choose-an-account 按手机号匹配 session_id=%s", candidate)
+                        return candidate
+        logger.warning("choose-an-account 未匹配到当前账号标识，回退选择首个 session")
+        return candidates[0]
+
     def _choose_account_select(self, html_text: str, current_url: str) -> str:
         """处理 /choose-an-account 多账号选择页（react-router SSR）。
 
@@ -2547,11 +2611,10 @@ class AuthFlow(PhoneRegisterMixin):
         POST 回 /choose-an-account，并 fallback 试几个候选 JSON endpoint。
         返回 next continue_url 或空串。
         """
-        m = re.search(r"us_[A-Za-z0-9]{16,}", html_text or "")
-        if not m:
+        session_id = self._select_choose_account_session(html_text)
+        if not session_id:
             logger.warning("/choose-an-account HTML 里没找到 us_* session id, 跳过")
             return ""
-        session_id = m.group(0)
         logger.debug(f"/choose-an-account 选 session_id={session_id}")
         headers = self._common_headers("https://auth.openai.com/choose-an-account")
         headers["Origin"] = "https://auth.openai.com"
@@ -2589,13 +2652,17 @@ class AuthFlow(PhoneRegisterMixin):
                 status = getattr(resp, "status_code", 0)
                 loc = (getattr(resp, "headers", {}) or {}).get("Location", "") or \
                       (getattr(resp, "headers", {}) or {}).get("location", "") or ""
-                # print 到 stdout 让 webui SSE 能看到每个候选的具体结果
+                success_status = status in (200, 201, 302, 303)
+                # A successful selector endpoint is allowed to return an empty
+                # JSON body after setting the session cookie.  Do not render the
+                # error-only "no message/code" diagnostic as a task warning.
+                response_detail = "" if success_status else describe_error(getattr(resp, "text", ""))
                 print(
                     f"[choose-an-account] {method} {url} [{kind}] -> "
-                    f"status={status} loc={loc[:120]} {describe_error(getattr(resp, 'text', ''))}",
+                    f"status={status} loc={loc[:120]}{f' {response_detail}' if response_detail else ''}",
                     flush=True,
                 )
-                if status in (200, 201, 302, 303):
+                if success_status:
                     next_url = ""
                     try:
                         j = resp.json() if resp is not None else {}

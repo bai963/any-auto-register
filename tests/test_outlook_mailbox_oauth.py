@@ -168,6 +168,34 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
 
     @mock.patch("requests.post")
     @mock.patch("requests.request")
+    def test_graph_401_falls_back_to_imap_instead_of_polling_until_timeout(
+        self, mock_request, mock_post
+    ):
+        mailbox = OutlookMailbox(token_endpoint="https://token.example.test")
+        account = MailboxAccount(
+            email="demo@outlook.com",
+            extra={"client_id": "client-id", "refresh_token": "refresh-token"},
+        )
+        mock_post.return_value = _FakeResponse(
+            200,
+            payload={"access_token": "graph-token", "expires_in": 3600},
+            text='{"access_token":"graph-token","expires_in":3600}',
+        )
+        mock_request.return_value = _FakeResponse(401, text='{"error":{"code":"InvalidAuthenticationToken"}}')
+        imap_fallback = mock.Mock(return_value="246810")
+
+        with mock.patch.object(mailbox._backends["imap"], "wait_for_code", imap_fallback), \
+             mock.patch.object(mailbox, "_log"):
+            code = mailbox.wait_for_code(account, timeout=30)
+
+        self.assertEqual(code, "246810")
+        self.assertEqual(account.extra["_oauth_backend_capability"], "imap")
+        # inbox 401 -> forced refresh -> 401 again -> immediate IMAP handoff.
+        self.assertLessEqual(mock_request.call_count, 2)
+        imap_fallback.assert_called_once()
+
+    @mock.patch("requests.post")
+    @mock.patch("requests.request")
     def test_wait_for_code_uses_graph_backend_by_default(self, mock_request, mock_post):
         mailbox = OutlookMailbox(token_endpoint="https://token.example.test")
         account = MailboxAccount(

@@ -8,6 +8,7 @@ mail retrieval.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 from typing import Any, Callable, Protocol
 
 from .microsoft_import_rules import (
@@ -33,6 +34,15 @@ class MicrosoftImportPool(Protocol):
     def snapshot(self, request, *, label: str): ...
 
 
+def _verify_receive_enabled() -> bool:
+    """Opt-in import-time check that the account can really receive mail.
+
+    Defaults to off: an account that fails in this environment may still work
+    behind a different proxy, so rejecting it at import must be a deliberate
+    choice (``MAIL_IMPORT_VERIFY_RECEIVE=1``).
+    """
+    return str(os.getenv("MAIL_IMPORT_VERIFY_RECEIVE", "0")).strip().lower() in {"1", "true", "yes"}
+
 
 class MicrosoftMailboxImportService:
     def __init__(
@@ -42,24 +52,45 @@ class MicrosoftMailboxImportService:
         *,
         alias_expander: Callable[..., list[MicrosoftMailImportRecord]],
         workers_resolver: Callable[[int], int],
+        verify_receive: bool | None = None,
     ):
         self._pool = pool
         self._probe_factory = probe_factory
         self._alias_expander = alias_expander
         self._workers_resolver = workers_resolver
+        self._verify_receive = _verify_receive_enabled() if verify_receive is None else bool(verify_receive)
 
     def _probe(self, record: MicrosoftMailImportRecord) -> dict[str, object]:
         if record.account_type != ACCOUNT_TYPE_MICROSOFT_OAUTH:
             return {"ok": True, "message": "ok"}
+        mailbox = self._probe_factory()
         try:
-            result = self._probe_factory().probe_oauth_availability(
+            result = mailbox.probe_oauth_availability(
                 email=record.email, client_id=record.client_id, refresh_token=record.refresh_token
             )
         except Exception as exc:
             return {"ok": False, "message": f"行 {record.line_number}: 微软邮箱可用性检测异常: {exc}"}
-        if result.get("ok"):
+        if not result.get("ok"):
+            return {"ok": False, "message": f"行 {record.line_number}: {result.get('message') or '微软邮箱可用性检测未通过'}"}
+        if not self._verify_receive:
             return {"ok": True, "message": "ok"}
-        return {"ok": False, "message": f"行 {record.line_number}: {result.get('message') or '微软邮箱可用性检测未通过'}"}
+        # A token alone does not prove the account can receive mail: Graph may
+        # answer 401 on every folder when the refresh_token lacks Mail.Read.
+        capability = getattr(mailbox, "probe_receive_capability", None)
+        if not callable(capability):
+            return {"ok": True, "message": "ok"}
+        try:
+            verdict = capability(
+                email=record.email, client_id=record.client_id, refresh_token=record.refresh_token
+            )
+        except Exception as exc:
+            return {"ok": False, "message": f"行 {record.line_number}: 微软邮箱收信能力检测异常: {exc}"}
+        if verdict.get("ok"):
+            return {"ok": True, "message": "ok"}
+        return {
+            "ok": False,
+            "message": f"行 {record.line_number}: {verdict.get('message') or '微软邮箱收信能力检测未通过'}",
+        }
 
     def execute(self, request: MailImportExecuteRequest, *, label: str) -> MailImportResponse:
         existing, registered = self._pool.existing_email_sets()

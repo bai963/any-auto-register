@@ -40,6 +40,7 @@ class MailboxProviderAdapter(MailProvider):
         ephemeral: bool = False,
         accepts_existing_account: bool = False,
         otp_timeout: Optional[int] = None,
+        prime_on_create: bool = True,
     ):
         self._mailbox = mailbox
         self._fixed_email = (fixed_email or "").strip()
@@ -47,6 +48,7 @@ class MailboxProviderAdapter(MailProvider):
         self._before_ids: set = set()
         self._dead = False
         self._otp_timeout = otp_timeout
+        self._prime_on_create = bool(prime_on_create)
         self.kind = kind
         self.pooled = pooled
         self.ephemeral = ephemeral
@@ -80,7 +82,8 @@ class MailboxProviderAdapter(MailProvider):
     def create_mailbox(self) -> str:
         account = self._mailbox.get_email()
         self._account = account
-        self.prime()
+        if self._prime_on_create:
+            self.prime()
 
         address = self._fixed_email or str(getattr(account, "email", "") or "").strip()
         if not address:

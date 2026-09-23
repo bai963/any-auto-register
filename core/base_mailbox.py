@@ -3,9 +3,12 @@ from __future__ import annotations
 """邮箱池基类 - 抽象临时邮箱/收件服务"""
 
 import json
+import os
 import random
+import socket
 import threading
 import time
+from urllib.parse import urlsplit, unquote
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -3221,6 +3224,13 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
                     self.mailbox._log(
                         f"[微软邮箱][IMAP] folder={folder} IMAP 查询异常: {exc}"
                     )
+                    # A connection/authentication failure happens before a
+                    # folder is selected. Retrying every folder and every poll
+                    # would turn one dead IMAP route into several minutes of
+                    # add-email OTP waiting. Surface it to the provider so the
+                    # binding flow can stop/requeue promptly.
+                    if imap_conn is None:
+                        raise RuntimeError(f"微软邮箱 IMAP 不可用: {exc}") from exc
                     continue
                 finally:
                     try:
@@ -3235,6 +3245,15 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
             poll_interval=5,
             poll_once=poll_once,
         )
+
+
+class _GraphUnauthorizedError(RuntimeError):
+    """Graph access token was issued but rejected by the API (missing scope).
+
+    This is not a transient token expiry: a forced refresh returns a token with
+    the same missing permission. Callers must fall back to IMAP or fail fast
+    instead of polling every folder until the OTP deadline expires.
+    """
 
 
 class OutlookGraphMailboxBackend(OutlookMailboxBackend):
@@ -3286,8 +3305,16 @@ class OutlookGraphMailboxBackend(OutlookMailboxBackend):
                             message_id = str(message.get("id") or "").strip()
                             if message_id:
                                 seen.add(f"{folder}:{message_id}")
-                    except Exception:
-                        pass
+                    except Exception as retry_exc:
+                        # Same token permission problem as wait_for_code: mark
+                        # IMAP-only so later polls skip the doomed Graph calls.
+                        extra = account.extra if isinstance(account.extra, dict) else {}
+                        account.extra = extra
+                        extra["_oauth_backend_capability"] = "imap"
+                        self.mailbox._log(
+                            "[微软邮箱] Graph 接口 401（token 缺少 Mail.Read 权限），"
+                            f"标记为仅 IMAP: {retry_exc}"
+                        )
                 else:
                     raise
         return seen
@@ -3450,18 +3477,43 @@ class OutlookGraphMailboxBackend(OutlookMailboxBackend):
                             self.mailbox._log(
                                 f"[微软邮箱][Graph] folder={folder} 刷新 token 后仍然失败: {retry_exc}"
                             )
+                            if "HTTP 401" in str(retry_exc):
+                                raise _GraphUnauthorizedError(str(retry_exc)) from retry_exc
                         continue
+                    if "HTTP 401" in exc_str:
+                        # A second, freshly minted token was rejected as well.
+                        raise _GraphUnauthorizedError(exc_str) from exc
                     self.mailbox._log(
                         f"[微软邮箱][Graph] folder={folder} 查询异常: {exc}"
                     )
                     continue
             return None
 
-        return self.mailbox._run_polling_wait(
-            timeout=timeout,
-            poll_interval=5,
-            poll_once=poll_once,
-        )
+        try:
+            return self.mailbox._run_polling_wait(
+                timeout=timeout,
+                poll_interval=5,
+                poll_once=poll_once,
+            )
+        except _GraphUnauthorizedError as exc:
+            # Do not keep polling a permission-less Graph token: mark the
+            # account as IMAP-only and hand this wait over to the IMAP backend.
+            extra = account.extra if isinstance(account.extra, dict) else {}
+            account.extra = extra
+            extra["_oauth_backend_capability"] = "imap"
+            extra.pop("_oauth_token_cache", None)
+            self.mailbox._log(
+                "[微软邮箱] Graph 接口 401（token 缺少 Mail.Read 权限），"
+                f"自动切换 IMAP 收码: {exc}"
+            )
+            return self.mailbox._backends["imap"].wait_for_code(
+                account,
+                keyword=keyword,
+                timeout=timeout,
+                before_ids=before_ids,
+                code_pattern=code_pattern,
+                **kwargs,
+            )
 
 
 class MailApiUrlOtpBackend(OutlookMailboxBackend):
@@ -3570,6 +3622,7 @@ class OutlookMailbox(BaseMailbox):
         self._mail_import_source = str(mail_import_source or "").strip().lower()
         self._pool_account_type = self._resolve_pool_account_type(mail_import_source)
         self._proxy = build_requests_proxy_config(proxy)
+        self._imap_proxy_url = str(proxy or "").strip()
         self._imap_servers = []
         if imap_server:
             self._imap_servers.append(str(imap_server).strip())
@@ -3907,6 +3960,42 @@ class OutlookMailbox(BaseMailbox):
                 "https://login.microsoftonline.com/common/oauth2/v2.0/token",
             ]
 
+    # 参考实现（auto_reg / any-auto-register 同源）给出的优先级常量：
+    # OUTLOOK_PROVIDER_PRIORITY = ["imap_new", "imap_old", "graph_api"]
+    # imap_old 就是“不带 scope 参数”的老 IMAP 端点，对应这里的空 scope。
+    _PRIORITY_LABELS = {
+        "imap_new": "imap_new",
+        "imap_old": "empty",
+        "graph_api": "graph_default",
+    }
+
+    def _outlook_provider_priority(self) -> list[str]:
+        """返回 scope 尝试顺序，可用 OUTLOOK_BACKEND_PRIORITY 覆盖。
+
+        未配置时保持原有行为（按当前后端优先）；显式配置 ``imap`` 即采用参考
+        实现的优先级：先 IMAP（new → old），Graph 作为兜底。
+        """
+        raw = str(os.getenv("OUTLOOK_BACKEND_PRIORITY", "")).strip().lower()
+        if not raw:
+            return []
+        labels: list[str] = []
+        for token in raw.replace(";", ",").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if token == "imap":
+                # 参考实现的 "imap" 指整条 IMAP 链：新 IMAP 再老 IMAP。
+                labels.extend(["imap_new", "empty"])
+            elif token == "imap_new":
+                labels.append("imap_new")
+            elif token in {"imap_old", "old"}:
+                labels.append("empty")
+            elif token in {"graph", "graph_api", "graph_default"}:
+                labels.append("graph_default")
+            elif token == "outlook_default":
+                labels.append("outlook_default")
+        return labels
+
     def _oauth_scope_candidates(
         self,
         preferred_backend: str | None = None,
@@ -3935,6 +4024,10 @@ class OutlookMailbox(BaseMailbox):
             if backend == "graph"
             else ["imap_new", "outlook_default", "graph_default", "empty"]
         )
+        configured = self._outlook_provider_priority()
+        if configured:
+            # Configured order first, remaining labels keep working as fallback.
+            ordered_labels = configured + [label for label in ordered_labels if label not in configured]
         raw_candidates = [(label, scope_map.get(label, "")) for label in ordered_labels]
 
         seen = set()
@@ -4058,6 +4151,111 @@ class OutlookMailbox(BaseMailbox):
             "message": f"微软邮箱可用性检测未通过: {last_error or 'OAuth token 获取失败'}",
         }
 
+    def probe_receive_capability(
+        self,
+        *,
+        email: str,
+        client_id: str,
+        refresh_token: str,
+        prefer_imap: bool = False,
+    ) -> dict[str, Any]:
+        """检测账号是否真的能收到邮件，而不是只换到了 token。
+
+        微软在 refresh_token 只被授予部分权限时，仍会为 ``.default`` scope 返回
+        200 和 access token，但该 token 调 Graph 会一路 401；反过来有些账号只在
+        IMAP 可用。只验证“拿到 token”会在导入阶段放进一批收不到码的账号，
+        运行期只能靠超时才发现。
+        """
+        if not client_id or not refresh_token:
+            return {
+                "ok": False,
+                "capability": "",
+                "reason": "missing_oauth_credentials",
+                "message": "缺少 client_id 或 refresh_token，无法检测收信能力",
+            }
+        account = MailboxAccount(
+            email=str(email or "").strip(),
+            extra={
+                "provider": "microsoft",
+                "client_id": str(client_id or "").strip(),
+                "refresh_token": str(refresh_token or "").strip(),
+                "account_type": "microsoft_oauth",
+            },
+        )
+        order = ["imap", "graph"] if prefer_imap else ["graph", "imap"]
+        reasons: list[str] = []
+        for backend in order:
+            if backend == "graph":
+                try:
+                    token = self._get_oauth_access_token(account, preferred_backend="graph")
+                    capability = str(
+                        (account.extra or {}).get("_oauth_backend_capability") or ""
+                    ).strip().lower()
+                    if capability != "graph":
+                        reasons.append("graph: token 不含 Graph 邮件权限")
+                        continue
+                    self._graph_request_json(
+                        method="GET",
+                        path="/me/mailFolders/inbox/messages",
+                        access_token=token,
+                        params={"$top": "1", "$select": "id"},
+                    )
+                    return {
+                        "ok": True,
+                        "capability": "graph",
+                        "reason": "ok",
+                        "message": "微软邮箱 Graph 收信可用",
+                    }
+                except Exception as exc:
+                    reasons.append(f"graph: {exc}")
+            else:
+                try:
+                    token = self._get_oauth_access_token(account, preferred_backend="imap")
+                    self._probe_imap_login(account, access_token=token)
+                    return {
+                        "ok": True,
+                        "capability": "imap",
+                        "reason": "ok",
+                        "message": "微软邮箱 IMAP 收信可用",
+                    }
+                except Exception as exc:
+                    reasons.append(f"imap: {exc}")
+        return {
+            "ok": False,
+            "capability": "",
+            "reason": "receive_unavailable",
+            "message": "微软邮箱收信不可用（Graph 与 IMAP 均失败）: " + "；".join(reasons),
+        }
+
+    def _probe_imap_login(self, account: MailboxAccount, *, access_token: str) -> None:
+        """只验证 IMAP 能否登录并选中收件箱，不拉取邮件。"""
+        import imaplib
+
+        last_error: Exception | None = None
+        for host in self._imap_servers:
+            if not host:
+                continue
+            try:
+                connection = self._connect_imap_ssl(imaplib, host, timeout=15)
+                try:
+                    if access_token:
+                        self._imap_auth_oauth(connection, email=account.email, access_token=access_token)
+                    password = str((account.extra or {}).get("password") or "")
+                    if not access_token and password:
+                        connection.login(account.email, password)
+                    status, _ = self._select_folder(connection, "INBOX")
+                    if status == "OK":
+                        return
+                    last_error = RuntimeError(f"SELECT INBOX status={status}")
+                finally:
+                    try:
+                        connection.logout()
+                    except Exception:
+                        pass
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"IMAP 登录失败: {last_error}")
+
     def _fetch_oauth_token_bundle(
         self,
         *,
@@ -4154,6 +4352,55 @@ class OutlookMailbox(BaseMailbox):
         auth_string = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
         imap_conn.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8"))
 
+    @staticmethod
+    def _is_proxy_transport_failure(exc: BaseException) -> bool:
+        text = str(exc).lower()
+        return (
+            isinstance(exc, (TimeoutError, socket.timeout))
+            or "timed out" in text
+            or "unexpected_eof" in text
+            or "eof occurred" in text
+            or "connection reset" in text
+        )
+
+    def _connect_imap_ssl(self, imaplib, host: str, *, timeout: int = 30, use_proxy: bool = True):
+        """Open IMAP through the task proxy, retrying direct only on timeout."""
+        proxy_url = self._imap_proxy_url if use_proxy else ""
+        if not proxy_url:
+            return imaplib.IMAP4_SSL(host, self._imap_port, timeout=timeout)
+        try:
+            import socks
+            import ssl
+
+            parts = urlsplit(proxy_url)
+            proxy_type = socks.PROXY_TYPE_HTTP if parts.scheme.lower().startswith("http") else socks.PROXY_TYPE_SOCKS5
+            sock = socks.socksocket()
+            sock.set_proxy(
+                proxy_type,
+                parts.hostname,
+                parts.port,
+                username=unquote(parts.username) if parts.username else None,
+                password=unquote(parts.password) if parts.password else None,
+                rdns=parts.scheme.lower() == "socks5h",
+            )
+            sock.settimeout(timeout)
+            sock.connect((host, self._imap_port))
+            context = ssl.create_default_context()
+            tls_sock = context.wrap_socket(sock, server_hostname=host)
+
+            class ConnectedImap(imaplib.IMAP4_SSL):
+                def open(self, _host, _port, timeout=None):
+                    self.sock = tls_sock
+                    self.file = self.sock.makefile("rb")
+
+            self._log(f"[微软邮箱][IMAP] 通过代理连接: {host}")
+            return ConnectedImap(host, self._imap_port, timeout=timeout)
+        except Exception as exc:
+            if not self._is_proxy_transport_failure(exc):
+                raise
+            self._log(f"[微软邮箱][IMAP] 代理连接/TLS 传输失败，改用直连: {host}")
+            return imaplib.IMAP4_SSL(host, self._imap_port, timeout=timeout)
+
     def _open_imap(self, account: MailboxAccount):
         import imaplib
 
@@ -4176,7 +4423,7 @@ class OutlookMailbox(BaseMailbox):
                 continue
             if access_token:
                 try:
-                    imap_conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
+                    imap_conn = self._connect_imap_ssl(imaplib, host, timeout=30)
                     self._imap_auth_oauth(
                         imap_conn, email=email_addr, access_token=access_token
                     )
@@ -4187,9 +4434,29 @@ class OutlookMailbox(BaseMailbox):
                         imap_conn.logout()
                     except Exception:
                         pass
+                    # A SOCKS/HTTP tunnel can complete TLS but break during
+                    # IMAP XOAUTH2. Retry the whole connection+auth direct once.
+                    # If direct also fails, OAuth is authoritative for this
+                    # imported account: do not repeat the same slow route via
+                    # password and do not walk a second host.
+                    if self._imap_proxy_url and self._is_proxy_transport_failure(exc):
+                        try:
+                            self._log(f"[微软邮箱][IMAP] 代理认证/TLS 传输失败，改用直连: {host}")
+                            imap_conn = self._connect_imap_ssl(imaplib, host, timeout=30, use_proxy=False)
+                            self._imap_auth_oauth(imap_conn, email=email_addr, access_token=access_token)
+                            return imap_conn
+                        except Exception as direct_exc:
+                            last_error = direct_exc
+                            try:
+                                imap_conn.logout()
+                            except Exception:
+                                pass
+                            raise RuntimeError(f"微软邮箱 IMAP 代理及直连均不可用: {direct_exc}") from direct_exc
+                    if access_token:
+                        raise RuntimeError(f"微软邮箱 IMAP OAuth 认证失败: {exc}") from exc
             if password:
                 try:
-                    imap_conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
+                    imap_conn = self._connect_imap_ssl(imaplib, host, timeout=30)
                     imap_conn.login(email_addr, password)
                     return imap_conn
                 except Exception as exc:
@@ -4198,6 +4465,18 @@ class OutlookMailbox(BaseMailbox):
                         imap_conn.logout()
                     except Exception:
                         pass
+                    if self._imap_proxy_url and self._is_proxy_transport_failure(exc):
+                        try:
+                            self._log(f"[微软邮箱][IMAP] 代理认证/TLS 传输失败，改用直连: {host}")
+                            imap_conn = self._connect_imap_ssl(imaplib, host, timeout=30, use_proxy=False)
+                            imap_conn.login(email_addr, password)
+                            return imap_conn
+                        except Exception as direct_exc:
+                            last_error = direct_exc
+                            try:
+                                imap_conn.logout()
+                            except Exception:
+                                pass
 
         raise RuntimeError(f"微软邮箱 IMAP 登录失败: {last_error}")
 

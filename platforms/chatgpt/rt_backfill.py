@@ -149,6 +149,8 @@ class RefreshTokenBackfiller:
         allow_login: bool = True,
         phone_only: bool = False,
         log_fn: Optional[Callable[[str], None]] = None,
+        task_control=None,
+        attempt_id=None,
     ):
         self.email = (email or "").strip()
         self.password = (password or "").strip()
@@ -165,6 +167,8 @@ class RefreshTokenBackfiller:
         self.phone_only = bool(phone_only)
         self._log_fn = log_fn
         self.log = log_fn or logger.info
+        self._task_control = task_control
+        self._attempt_id = attempt_id
         # 当前正在跑的 flow，报错后还要从它身上把已到手的凭证捞回来
         self._active_flow: Optional[AuthFlow] = None
 
@@ -316,13 +320,26 @@ class RefreshTokenBackfiller:
             extra=self.extra_config,
             proxy=self.proxy,
         )
-        return MailboxProviderAdapter(
+        provider = MailboxProviderAdapter(
             mailbox,
             kind=str(self.extra_config.get("mail_provider") or "mailbox"),
             pooled=True,
             ephemeral=True,
             otp_timeout=self._otp_timeout(),
+            # Binding always passes issued_after to wait_for_otp; avoid a slow
+            # pre-send baseline read (especially broken IMAP) for this fresh,
+            # one-use pool address.
+            prime_on_create=False,
         )
+        # The add-email provider is created lazily inside AuthFlow, so it does
+        # not inherit the task context passed to the primary account mailbox.
+        # Inject it here: polling remains interruptible and logs retain task id.
+        provider.bind_task_control(
+            task_control=self._task_control,
+            attempt_id=self._attempt_id,
+            log_fn=self._log_fn,
+        )
+        return provider
 
     def _build_sms_callback(self):
         """Codex 授权链可能被打到 add-phone，配了接码就顺手过掉。"""
@@ -400,10 +417,22 @@ class RefreshTokenBackfiller:
             account = getattr(provider, "account", None)
             if account is None:
                 continue
+            bind_status = str(getattr(provider, "_email_bind_status", "") or "")
+            if bind_status == "used":
+                # Pool consumption is final only after OpenAI validated the
+                # email OTP.
+                status = "used"
+            elif getattr(provider, "_email_bind_transport_failed", False):
+                # Network/TLS/Graph-permission failure: the address was never
+                # bound and its credentials were never rejected, so return it
+                # to the pool instead of permanently marking it failed.
+                status = "available"
+            else:
+                status = "failed"
             result.mailbox_status_events.append({
                 "email": str(getattr(account, "email", "") or ""),
                 "account_id": str(getattr(account, "account_id", "") or ""),
-                "status": "used" if getattr(provider, "_email_bind_status", "") == "used" else "failed",
+                "status": status,
             })
         for attr in ("refresh_token", "access_token", "session_token", "id_token", "cookie_header"):
             value = str(getattr(auth, attr, "") or "").strip()

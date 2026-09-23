@@ -49,6 +49,14 @@ PHONE_VERIFICATION_REFERER = "https://auth.openai.com/contact-verification"
 # 先等再首次轮询，避免高并发下对邮箱 API/IMAP 造成无意义的瞬时读峰值。
 EMAIL_OTP_INITIAL_DELAY_SECONDS = 10
 
+
+def _email_otp_initial_delay(flow) -> float:
+    """Return a configurable but conservative mail-delivery grace period."""
+    try:
+        return max(0.0, float(flow._get_env("OPENAI_EMAIL_OTP_INITIAL_DELAY", str(EMAIL_OTP_INITIAL_DELAY_SECONDS))))
+    except (TypeError, ValueError):
+        return float(EMAIL_OTP_INITIAL_DELAY_SECONDS)
+
 # 这个号不能用，换下一个再试。接码平台的号是回收再卖的，"已被占用"是常态，
 # 服务端的说法有下划线（code）和大白话（message）两种，两种都得认。
 _PHONE_REJECTED_PATTERNS = (
@@ -89,6 +97,29 @@ def is_phone_rejected_error(text: str) -> bool:
 
 def is_flow_state_error(text: str) -> bool:
     return _matches(text, _FLOW_STATE_PATTERNS)
+
+
+# 收信链路的传输/权限故障：地址和凭据都没被 OpenAI 判废，不该把号烧掉。
+_TRANSPORT_FAILURE_PATTERNS = (
+    "imap",
+    "graph 接口 401",
+    "http 401",
+    "ssl",
+    "tls",
+    "handshake",
+    "timed out",
+    "timeout",
+    "eof occurred",
+    "unexpected_eof",
+    "connection reset",
+    "代理",
+    "不可用",
+)
+
+
+def is_transport_failure_error(text: str) -> bool:
+    """True when收信失败源于网络/传输/后端权限，而非邮箱本身不可用。"""
+    return _matches(text, _TRANSPORT_FAILURE_PATTERNS)
 
 
 class PhoneRegisterMixin:
@@ -427,11 +458,12 @@ class PhoneRegisterMixin:
                 otp_timeout = max(10, int(self._get_env("OTP_TIMEOUT", "180")))
             except Exception:
                 otp_timeout = 180
+            initial_delay = _email_otp_initial_delay(self)
             logger.info(
-                "[绑定邮箱] 验证码已发送，等待 %ds 后开始读取邮箱: %s",
-                EMAIL_OTP_INITIAL_DELAY_SECONDS, email,
+                "[绑定邮箱] 验证码已发送，等待 %.1fs 后开始读取邮箱: %s",
+                initial_delay, email,
             )
-            self._sleep_before_email_otp(EMAIL_OTP_INITIAL_DELAY_SECONDS)
+            self._sleep_before_email_otp(initial_delay)
             code = mail_provider.wait_for_otp(email, timeout=otp_timeout, issued_after=sent_at)
             validate_resp = self.verify_otp(code)
             self.result.bound_email = email
@@ -440,9 +472,16 @@ class PhoneRegisterMixin:
             return self._normalize_continue_url(
                 self._extract_continue_url_from_step(validate_resp)
             ) or next_url or continue_url or ""
-        except Exception:
+        except Exception as exc:
             # 引擎据此按真实结果回写邮箱池；这里不吞异常，外层决定是否换邮箱。
             setattr(mail_provider, "_email_bind_status", "failed")
+            # A transport/permission failure says nothing about the address
+            # itself: release it back to the pool instead of burning it.
+            setattr(
+                mail_provider,
+                "_email_bind_transport_failed",
+                is_transport_failure_error(str(exc)),
+            )
             raise
 
     def _sleep_before_email_otp(self, seconds: float) -> None:
@@ -501,6 +540,15 @@ class PhoneRegisterMixin:
             except Exception as exc:
                 last_error = str(exc)
                 logger.warning("[绑定邮箱] 第 %d/%d 个邮箱失败: %s", attempt, max_attempts, last_error)
+                # add-email/send has already advanced the authorize state once.
+                # If its receiver path fails, guessing with a new address often
+                # yields invalid_auth_step and burns pool accounts. Only retry
+                # an address when the provider failure happened before send.
+                if getattr(provider, "_email_bind_address", ""):
+                    self._email_bind_status = "verification_failed"
+                    self._bind_email_error = last_error
+                    logger.warning("[绑定邮箱] 已发码邮箱收信失败，停止换邮箱以避免消耗无效号")
+                    return continue_url
             if attempt >= max_attempts or not callable(mail_provider_factory):
                 break
             state = self._check_add_email_state(continue_url)

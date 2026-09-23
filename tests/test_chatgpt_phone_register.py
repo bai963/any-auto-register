@@ -243,6 +243,60 @@ class BindEmailTests(unittest.TestCase):
         self.assertFalse(flow.result.bound_email)
         self.assertIn("invalid state", flow._bind_email_error)
 
+    def test_sent_email_receive_failure_does_not_claim_second_pool_address(self):
+        flow = _flow()
+        flow._is_add_email_state = lambda **_kwargs: True
+        first = _FakeMailProvider()
+        second = _FakeMailProvider()
+        factory = mock.Mock(return_value=second)
+        flow.bind_email = mock.Mock(side_effect=lambda provider, **_kwargs: (
+            setattr(provider, "_email_bind_address", "first@example.com"),
+            (_ for _ in ()).throw(TimeoutError("waiting for OTP timed out")),
+        )[1])
+
+        result = flow._try_bind_email(first, "https://auth.openai.com/add-email", factory)
+
+        self.assertEqual(result, "https://auth.openai.com/add-email")
+        factory.assert_not_called()
+        self.assertEqual(flow._email_bind_status, "verification_failed")
+
+    def test_bind_email_flags_transport_failure_for_pool_release(self):
+        flow = _flow()
+        flow._normalize_continue_url = lambda url: url
+        flow.add_email_send = mock.Mock(
+            return_value={
+                "page": {"type": "email_otp_verification"},
+                "continue_url": "https://auth.openai.com/email-verification",
+            }
+        )
+        provider = _FakeMailProvider()
+        provider.wait_for_otp = mock.Mock(
+            side_effect=RuntimeError("微软邮箱 IMAP 不可用: handshake operation timed out")
+        )
+
+        with self.assertRaises(RuntimeError):
+            flow.bind_email(provider)
+
+        self.assertEqual(getattr(provider, "_email_bind_status", ""), "failed")
+        self.assertTrue(getattr(provider, "_email_bind_transport_failed", False))
+
+    def test_bind_email_rejected_code_is_not_flagged_as_transport_failure(self):
+        flow = _flow()
+        flow._normalize_continue_url = lambda url: url
+        flow.add_email_send = mock.Mock(
+            return_value={
+                "page": {"type": "email_otp_verification"},
+                "continue_url": "https://auth.openai.com/email-verification",
+            }
+        )
+        flow.verify_otp = mock.Mock(side_effect=RuntimeError("Invalid authorization step. invalid_auth_step"))
+        provider = _FakeMailProvider()
+
+        with self.assertRaises(RuntimeError):
+            flow.bind_email(provider)
+
+        self.assertFalse(getattr(provider, "_email_bind_transport_failed", True))
+
     def test_no_provider_means_no_binding(self):
         flow = _flow()
 

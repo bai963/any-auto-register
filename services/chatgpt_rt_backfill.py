@@ -146,6 +146,8 @@ def backfill_account_data(
         allow_login=allow_login,
         phone_only=is_phone_only,
         log_fn=log,
+        task_control=task_control,
+        attempt_id=attempt_id,
     ).run()
 
 

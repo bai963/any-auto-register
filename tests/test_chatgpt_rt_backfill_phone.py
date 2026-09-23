@@ -21,6 +21,8 @@ class PhoneOnlyBackfillRoutingTests(unittest.TestCase):
             backfill_account_data(email="+573196336329", password="pw", extra={})
         mailbox.assert_not_called()
         self.assertTrue(backfiller.call_args.kwargs["phone_only"])
+        self.assertIn("task_control", backfiller.call_args.kwargs)
+        self.assertIn("attempt_id", backfiller.call_args.kwargs)
 
     def test_action_backfill_bound_email_updates_primary_account_and_marks_mailbox(self):
         from api.actions import _apply_action_result
@@ -53,6 +55,64 @@ class PhoneOnlyBackfillRoutingTests(unittest.TestCase):
             apply_backfill_result(model, result)
         self.assertEqual(model.email, "bound@example.com")
         mark_used.assert_called_once_with(result.mailbox_status_events)
+
+    def test_lazy_add_email_provider_inherits_task_control_and_log_context(self):
+        backfiller = RefreshTokenBackfiller(
+            email="+573196336329", password="pw", phone_only=True,
+            task_control="control", attempt_id=7, log_fn=lambda _message: None,
+        )
+        mailbox = mock.Mock()
+        provider = mock.Mock()
+        with mock.patch("core.base_mailbox.create_mailbox", return_value=mailbox), \
+             mock.patch("platforms.chatgpt.protocol.mailbox_adapter.MailboxProviderAdapter", return_value=provider):
+            built = backfiller._build_email_bind_provider()
+        self.assertIs(built, provider)
+        provider.bind_task_control.assert_called_once_with(
+            task_control="control", attempt_id=7, log_fn=backfiller._log_fn,
+        )
+
+    def test_phone_bind_provider_skips_slow_pre_send_mailbox_prime(self):
+        backfiller = RefreshTokenBackfiller(email="+573196336329", password="pw", phone_only=True)
+        with mock.patch("core.base_mailbox.create_mailbox", return_value=mock.Mock()), \
+             mock.patch("platforms.chatgpt.protocol.mailbox_adapter.MailboxProviderAdapter") as adapter:
+            backfiller._build_email_bind_provider()
+        self.assertFalse(adapter.call_args.kwargs["prime_on_create"])
+
+    def test_transport_failed_bind_returns_mailbox_to_available_pool(self):
+        backfiller = RefreshTokenBackfiller(email="+573196336329", phone_only=True)
+        result = BackfillResult(success=False)
+        provider = mock.Mock()
+        provider.account = mock.Mock(email="a@outlook.com", account_id="7")
+        provider._email_bind_status = "failed"
+        provider._email_bind_transport_failed = True
+        flow = mock.Mock()
+        flow.result = mock.Mock(bound_email="", refresh_token="", access_token="", session_token="", id_token="", cookie_header="")
+        flow._email_bind_providers = [provider]
+
+        backfiller._absorb(result, flow)
+
+        self.assertEqual(
+            [event["status"] for event in result.mailbox_status_events],
+            ["available"],
+        )
+
+    def test_rejected_bind_marks_mailbox_failed(self):
+        backfiller = RefreshTokenBackfiller(email="+573196336329", phone_only=True)
+        result = BackfillResult(success=False)
+        provider = mock.Mock()
+        provider.account = mock.Mock(email="a@outlook.com", account_id="7")
+        provider._email_bind_status = "failed"
+        provider._email_bind_transport_failed = False
+        flow = mock.Mock()
+        flow.result = mock.Mock(bound_email="", refresh_token="", access_token="", session_token="", id_token="", cookie_header="")
+        flow._email_bind_providers = [provider]
+
+        backfiller._absorb(result, flow)
+
+        self.assertEqual(
+            [event["status"] for event in result.mailbox_status_events],
+            ["failed"],
+        )
 
     def test_phone_only_uses_phone_login_after_session_strategy(self):
         backfiller = RefreshTokenBackfiller(
