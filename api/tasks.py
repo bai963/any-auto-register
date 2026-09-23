@@ -509,6 +509,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         _base_extra.update(
             {k: v for k, v in req.extra.items() if v is not None and v != ""}
         )
+        # Passed into the spawned registration process and persisted with every
+        # rented activation; it enables task-scoped cancellation on Stop.
+        _base_extra["_sms_task_id"] = task_id
 
         # 每个 worker 领取代理租约，默认一个代理同时只服务一个任务。
         # 代理不足会等待空闲代理，而不是让多个账号意外复用同一出口。
@@ -639,7 +642,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         next_start_time = time.time() + req.register_delay_seconds
                 control.checkpoint(attempt_id=attempt_id)
 
-                merged_extra = _base_extra
+                merged_extra = dict(_base_extra)
 
                 _config = RegisterConfig(
                     executor_type=req.executor_type,
@@ -1518,8 +1521,24 @@ def stop_task(task_id: str):
     if not _task_store.exists(task_id):
         raise HTTPException(409, "任务已结束或服务已重启，无法停止")
     control = _task_store.request_stop(task_id)
-    _log(task_id, "收到手动停止任务请求")
-    return {"ok": True, "task_id": task_id, "control": control}
+    # The registration itself runs in a separate process and is terminated by
+    # its parent. Queue cancellation here first, so its currently rented number
+    # is released even if the child cannot run its finally block.
+    cancelled = 0
+    try:
+        from services.sms_service import cancel_task_sms_activations, resolve_sms_settings
+        settings = resolve_sms_settings()
+        cancelled = cancel_task_sms_activations(settings, task_id)
+        if cancelled:
+            # Do not make the stop request wait for supplier HTTP.  Wake a
+            # bounded worker pass now; the watchdog remains the durable retry.
+            from services.sms_refund_watchdog import run_once
+            threading.Thread(target=run_once, args=(settings,), daemon=True,
+                             name="sms-cancel-on-task-stop").start()
+    except Exception:
+        logger.warning("停止任务时接码取消入队失败: task=%s", task_id, exc_info=True)
+    _log(task_id, f"收到手动停止任务请求；已将 {cancelled} 个未完成接码号加入取消队列")
+    return {"ok": True, "task_id": task_id, "control": control, "sms_cancel_queued": cancelled}
 
 
 @router.get("/logs")

@@ -115,6 +115,8 @@ class SmsActivationModel(SQLModel, table=True):
     activation_id: str = Field(max_length=128)
     phone_number: str = Field(default="", max_length=64)
     country: str = Field(default="", max_length=32)
+    # Ownership isolates cancellation when several registration tasks rent in parallel.
+    task_id: str = Field(default="", index=True, max_length=128)
     state: str = Field(default="rented", index=True, max_length=32)
     rented_at: datetime = Field(default_factory=_utcnow, index=True)
     activation_deadline_at: datetime = Field(index=True)
@@ -379,8 +381,19 @@ def _migrate_icloud_aliases_schema() -> None:
             session.commit()
 
 
+def _migrate_sms_activations_schema() -> None:
+    """Add task ownership to databases created before task-scoped SMS cleanup."""
+    if engine.url.get_backend_name() == "sqlite":
+        with engine.begin() as conn:
+            columns = {str(row[1]) for row in conn.exec_driver_sql("PRAGMA table_info('sms_activations')").fetchall()}
+            if columns and "task_id" not in columns:
+                conn.exec_driver_sql("ALTER TABLE sms_activations ADD COLUMN task_id TEXT DEFAULT ''")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_sms_activations_task_id ON sms_activations (task_id)")
+
+
 def init_db():
     SQLModel.metadata.create_all(engine)
+    _migrate_sms_activations_schema()
     _migrate_outlook_accounts_schema()
     _migrate_icloud_aliases_schema()
 

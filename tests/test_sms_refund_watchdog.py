@@ -7,7 +7,7 @@ from pathlib import Path
 from core.db import SmsActivationModel, SmsCleanupJobModel, engine
 from sqlmodel import Session
 from services import sms_refund_watchdog as watchdog
-from services.sms_service import _utcnow
+from services.sms_service import _utcnow, cancel_task_sms_activations
 
 
 def _activation(state, *, sent=False, due=True):
@@ -154,3 +154,32 @@ def test_refund_status_normalizes_sqlite_naive_datetimes():
         session.commit()
     health = watchdog.refund_status()
     assert health["oldest_open_job_seconds"] >= 0
+
+
+def test_stopping_task_queues_immediate_cancel_only_for_its_unused_numbers():
+    now = _utcnow()
+    with Session(engine) as session:
+        mine = SmsActivationModel(
+            provider_identity="provider", activation_id="stop-mine", task_id="task-stop",
+            state="sms_sent", rented_at=now, activation_deadline_at=now + timedelta(minutes=10),
+            sms_sent_at=now, code_deadline_at=now + timedelta(minutes=4), created_at=now, updated_at=now,
+        )
+        other = SmsActivationModel(
+            provider_identity="provider", activation_id="stop-other", task_id="another-task",
+            state="rented", rented_at=now, activation_deadline_at=now + timedelta(minutes=10),
+            created_at=now, updated_at=now,
+        )
+        completed = SmsActivationModel(
+            provider_identity="provider", activation_id="stop-finished", task_id="task-stop",
+            state="finished", rented_at=now, activation_deadline_at=now, created_at=now, updated_at=now,
+        )
+        session.add_all([mine, other, completed]); session.commit()
+        mine_id, other_id = mine.id, other.id
+    assert cancel_task_sms_activations({}, "task-stop") == 1
+    with Session(engine) as session:
+        assert session.get(SmsActivationModel, mine_id).state == "refund_pending"
+        assert session.get(SmsActivationModel, other_id).state == "rented"
+        jobs = session.query(SmsCleanupJobModel).filter_by(activation_db_id=mine_id, action="cancel").all()
+        assert len(jobs) == 1 and jobs[0].status == "pending"
+    # Repeat stops are idempotent and never create a duplicate supplier cancel.
+    assert cancel_task_sms_activations({}, "task-stop") == 0

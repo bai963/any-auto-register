@@ -368,6 +368,7 @@ class SmsActivateProvider(BaseSmsProvider):
         max_price: float = -1,
         fixed_price: float = -1,
         proxy: Optional[str] = None,
+        task_id: str = "",
     ):
         self.api_key = str(api_key or "").strip()
         self.base_url = str(base_url or "").strip() or self.DEFAULT_BASE_URL
@@ -377,6 +378,7 @@ class SmsActivateProvider(BaseSmsProvider):
         # 仅按 max_price 控制租号，固定价会要求恰好命中某个价位并无谓缩小库存。
         # 保留构造参数以兼容旧调用，但不再用于请求。
         self.fixed_price = -1.0
+        self.task_id = str(task_id or "")[:128]
         self._proxy = (proxy or "").strip() or None
         self._proxies = {"http": self._proxy, "https": self._proxy} if self._proxy else None
         self.last_code_result: Optional[dict] = None
@@ -437,7 +439,8 @@ class SmsActivateProvider(BaseSmsProvider):
             if existing is None:
                 session.add(SmsActivationModel(
                     provider_identity=identity, activation_id=str(activation.activation_id),
-                    phone_number=activation.phone_number, country=activation.country, state=state,
+                    phone_number=activation.phone_number, country=activation.country,
+                    task_id=self.task_id, state=state,
                     rented_at=now,
                     activation_deadline_at=now + timedelta(seconds=SMS_ACTIVATION_MAX_LIFETIME_SECONDS),
                     created_at=now, updated_at=now,
@@ -1050,6 +1053,7 @@ def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
         max_price=_safe_float(config.get("sms_max_price"), -1),
         fixed_price=_safe_float(config.get("sms_fixed_price"), -1),
         proxy=(str(config.get("sms_proxy") or config.get("proxy") or "")).strip() or None,
+        task_id=str(config.get("_sms_task_id") or ""),
     )
 
 
@@ -1274,6 +1278,40 @@ class PhoneCallbackController:
         # 高并发模式不再持有全局手机验证锁；保留方法兼容既有调用点。
         self._verify_lock_acquired = False
 
+
+
+def cancel_task_sms_activations(settings: dict, task_id: str) -> int:
+    """Queue immediate refunds for all unused numbers owned by a stopped task.
+
+    The durable queue is used even if the supplier is temporarily unavailable;
+    the watchdog retries until cancel succeeds.
+    """
+    task_id = str(task_id or "")
+    if not task_id:
+        return 0
+    now = _utcnow()
+    queued = 0
+    with database_write_session() as session:
+        rows = session.query(SmsActivationModel).filter(
+            SmsActivationModel.task_id == task_id,
+            SmsActivationModel.state.notin_(("refunded", "finished", "finish_pending")),
+        ).all()
+        for row in rows:
+            existing = session.query(SmsCleanupJobModel).filter_by(
+                activation_db_id=row.id, action="cancel"
+            ).first()
+            if existing is not None and existing.status in {"pending", "retrying", "processing", "succeeded"}:
+                continue
+            row.state, row.refund_requested_at, row.updated_at = "refund_pending", now, now
+            row.version += 1
+            session.add(row)
+            session.add(SmsCleanupJobModel(
+                activation_db_id=row.id, action="cancel", status="pending", next_retry_at=now,
+                reason="registration task stopped", created_at=now, updated_at=now,
+            ))
+            queued += 1
+        session.commit()
+    return queued
 
 def resolve_sms_settings(extra_config: Optional[dict] = None) -> dict:
     """把全局配置里的 ``sms_*`` 项和本次任务的覆盖合并成一份接码配置。"""
