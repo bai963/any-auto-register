@@ -11,6 +11,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Any, Callable
 from .proxy_utils import build_requests_proxy_config
+from .mailbox_utils import (
+    decode_mail_content,
+    extract_verification_code,
+    extract_yyds_verification_code,
+    polling_wait,
+)
 
 
 @dataclass
@@ -51,22 +57,14 @@ class BaseMailbox(ABC):
         poll_once: Callable[[], Optional[str]],
         timeout_message: str | None = None,
     ) -> str:
-        timeout_seconds = max(int(timeout or 0), 1)
-        deadline = time.monotonic() + timeout_seconds
-
-        while time.monotonic() < deadline:
-            self._checkpoint()
-            code = poll_once()
-            if code:
-                return code
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            self._sleep_with_checkpoint(min(float(poll_interval), remaining))
-
-        self._checkpoint()
-        raise TimeoutError(timeout_message or f"等待验证码超时 ({timeout_seconds}s)")
+        return polling_wait(
+            timeout=timeout,
+            poll_interval=poll_interval,
+            poll_once=poll_once,
+            checkpoint=self._checkpoint,
+            sleep=self._sleep_with_checkpoint,
+            timeout_message=timeout_message,
+        )
 
     @abstractmethod
     def get_email(self) -> MailboxAccount:
@@ -87,130 +85,24 @@ class BaseMailbox(ABC):
         ...
 
     def _safe_extract(self, text: str, pattern: str = None) -> Optional[str]:
-        """通用验证码提取逻辑：若有捕获组则返回 group(1)，否则返回 group(0)"""
-        import re
-
-        text = str(text or "")
-        if not text:
-            return None
-
-        patterns = []
-        if pattern:
-            patterns.append(pattern)
-
-        # 先匹配带明显语义的验证码，避免误提取 MIME boundary、时间戳等 6 位数字。
-        patterns.extend(
-            [
-                r"(?is)(?:verification\s+code|one[-\s]*time\s+(?:password|code)|security\s+code|login\s+code|验证码|校验码|动态码|認證碼|驗證碼)[^0-9]{0,30}(\d{6})",
-                r"(?is)\bcode\b[^0-9]{0,12}(\d{6})",
-                r"(?<!#)(?<!\d)(\d{6})(?!\d)",
-            ]
-        )
-
-        for regex in patterns:
-            m = re.search(regex, text)
-            if m:
-                # 兼容逻辑：若 pattern 中有捕获组则取 group(1)，否则取 group(0)
-                return m.group(1) if m.groups() else m.group(0)
-        return None
+        """Backward-compatible provider facade for shared extraction logic."""
+        return extract_verification_code(text, pattern)
 
     def _decode_raw_content(self, raw: str) -> str:
-        """解析邮件原始文本 (借鉴自 Fugle)，处理 Quoted-Printable 和 HTML 实体"""
-        import quopri, html, re
-
-        text = str(raw or "")
-        if not text:
-            return ""
-        # 简单切分 Header 和 Body
-        if "\r\n\r\n" in text:
-            text = text.split("\r\n\r\n", 1)[1]
-        elif "\n\n" in text:
-            text = text.split("\n\n", 1)[1]
-        try:
-            # 处理 Quoted-Printable
-            decoded_bytes = quopri.decodestring(text)
-            text = decoded_bytes.decode("utf-8", errors="ignore")
-        except Exception:
-            pass
-        # 清除 HTML 标签并反转义
-        text = html.unescape(text)
-        text = re.sub(r"(?im)^content-(?:type|transfer-encoding):.*$", " ", text)
-        text = re.sub(r"(?im)^--+[_=\w.-]+$", " ", text)
-        text = re.sub(r"(?i)----=_part_[\w.]+", " ", text)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
+        """Backward-compatible provider facade for shared decoding logic."""
+        return decode_mail_content(raw)
 
     @abstractmethod
     def get_current_ids(self, account: MailboxAccount) -> set:
         """返回当前邮件 ID 集合（用于过滤旧邮件）"""
         ...
     def _yyds_safe_extract(self, text: str, pattern: str = None) -> Optional[str]:
-        """通用验证码提取逻辑：若有捕获组则返回 group(1)，否则返回 group(0)"""
-        import re
-
-        text = str(text or "")
-        if not text:
-            return None
-
-        # [修复点 1]：优先过滤掉所有 URL 链接，直接从根源防止提取到追踪链接（如 SendGrid）里的随机数字
-        text = re.sub(r"https?://\S+", "", text)
-
-        patterns = []
-        if pattern:
-            # [修复点 2]：如果外部传入了纯 \d{6} 的粗糙正则，自动为其加上字母数字边界
-            if pattern in (r"\d{6}", r"(\d{6})"):
-                patterns.append(r"(?<![a-zA-Z0-9])(\d{6})(?![a-zA-Z0-9])")
-            else:
-                patterns.append(pattern)
-
-        # 先匹配带明显语义的验证码，避免误提取 MIME boundary、时间戳等 6 位数字。
-        patterns.extend(
-            [
-                r"(?is)(?:verification\s+code|one[-\s]*time\s+(?:password|code)|security\s+code|login\s+code|验证码|校验码|动态码|認證碼|驗證碼)[^0-9]{0,30}(\d{6})",
-                r"(?is)\bcode\b[^0-9]{0,12}(\d{6})",
-                # [修复点 3]：修改兜底正则，严格要求 6 位数字前后不能有字母或数字（防止匹配 u20216706）
-                r"(?<![a-zA-Z0-9])(\d{6})(?![a-zA-Z0-9])",
-            ]
-        )
-
-        for regex in patterns:
-            m = re.search(regex, text)
-            if m:
-                # 兼容逻辑：若 pattern 中有捕获组则取 group(1)，否则取 group(0)
-                return m.group(1) if m.groups() else m.group(0)
-        return None
+        """Legacy alias retained while providers migrate to mailbox_utils."""
+        return extract_yyds_verification_code(text, pattern)
 
     def _yyds_decode_raw_content(self, raw: str) -> str:
-        """解析邮件原始文本 (借鉴自 Fugle)，处理 Quoted-Printable 和 HTML 实体"""
-        import quopri, html, re
-
-        text = str(raw or "")
-        if not text:
-            return ""
-            
-        # [修复点 4]：只有在明确包含常见邮件 Header 时，才进行 \r\n\r\n 切分。
-        # 否则会误删 MaliAPI 等直接返回的已解析 JSON 正文内容（遇到普通的正文换行就错误截断了）
-        if re.search(r"(?im)^(?:Return-Path|Received|Date|From|To|Subject|Content-Type):", text):
-            if "\r\n\r\n" in text:
-                text = text.split("\r\n\r\n", 1)[1]
-            elif "\n\n" in text:
-                text = text.split("\n\n", 1)[1]
-                
-        try:
-            # 处理 Quoted-Printable
-            decoded_bytes = quopri.decodestring(text)
-            text = decoded_bytes.decode("utf-8", errors="ignore")
-        except Exception:
-            pass
-        # 清除 HTML 标签并反转义
-        text = html.unescape(text)
-        text = re.sub(r"(?im)^content-(?:type|transfer-encoding):.*$", " ", text)
-        text = re.sub(r"(?im)^--+[_=\w.-]+$", " ", text)
-        text = re.sub(r"(?i)----=_part_[\w.]+", " ", text)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
+        """Legacy alias retained while providers migrate to mailbox_utils."""
+        return decode_mail_content(raw, preserve_parsed_body=True)
 
 def create_mailbox(
     provider: str, extra: dict = None, proxy: str = None
@@ -3729,9 +3621,11 @@ class OutlookMailbox(BaseMailbox):
 
     @staticmethod
     def _resolve_pool_account_type(mail_import_source: Any) -> str:
-        from services.mail_imports.import_source import resolve_pool_account_type
+        # The core runtime must not import the mail-import application layer
+        # merely to select Outlook/Hotmail/MailAPI entries from its pool.
+        from .microsoft_mail_source import resolve_microsoft_pool_account_type
 
-        return resolve_pool_account_type(mail_import_source)
+        return resolve_microsoft_pool_account_type(mail_import_source)
 
     @staticmethod
     def _describe_pool_account_type(account_type: Any) -> str:
@@ -3768,7 +3662,6 @@ class OutlookMailbox(BaseMailbox):
         from core.db import engine, AccountModel, OutlookAccountModel, _utcnow
 
         wanted_type = self._pool_account_type
-        backend = engine.url.get_backend_name()
         if wanted_type:
             self._log(
                 "[微软邮箱] 号池筛选: "
@@ -3777,6 +3670,14 @@ class OutlookMailbox(BaseMailbox):
             )
         else:
             self._log("[微软邮箱] 号池筛选: 未指定导入类型，整池取号")
+
+        # Compatibility facade: the repository owns the transaction and
+        # cross-process claim semantics while this class retains its API/logs.
+        from .outlook_pool_repository import OutlookPoolRepository
+        return OutlookPoolRepository().claim_available(
+            wanted_type=wanted_type,
+            type_label=self._describe_pool_account_type(wanted_type) if wanted_type else "",
+        )
 
         # SQLite 的 IMMEDIATE 会等待 busy_timeout；PG 的 SKIP LOCKED 则直接跳过竞争行。
         with Session(engine) as session:
@@ -3918,8 +3819,14 @@ class OutlookMailbox(BaseMailbox):
         refresh_token = str(extra.get("refresh_token") or "")
         account_type = self._normalize_account_type(extra.get("account_type"))
         mailapi_url = str(extra.get("mailapi_url") or "")
+        from .outlook_pool_repository import OutlookPoolRepository
 
         with self._lock:
+            OutlookPoolRepository().requeue(
+                email=email, password=password, client_id=client_id,
+                refresh_token=refresh_token, account_type=account_type, mailapi_url=mailapi_url,
+            )
+            return
             with Session(engine) as session:
                 existing = session.exec(
                     select(OutlookAccountModel).where(OutlookAccountModel.email == email)
@@ -3963,7 +3870,10 @@ class OutlookMailbox(BaseMailbox):
 
         email = str(getattr(account, "email", "") or "").strip()
         account_id = str(getattr(account, "account_id", "") or "").strip()
+        from .outlook_pool_repository import OutlookPoolRepository
         with self._lock:
+            OutlookPoolRepository().set_status(account_id=account_id, email=email, status=normalized)
+            return
             with Session(engine) as session:
                 row = None
                 if account_id.isdigit():
@@ -4666,6 +4576,10 @@ def apply_mailbox_status_events(events) -> None:
     spawn 注册子进程只返回事件，避免 SQLite 多进程同时写状态表。SQLite 在此
     使用单写者锁；PostgreSQL 保持并行事务能力。无效或非 Outlook 事件忽略。
     """
+    from .outlook_pool_repository import OutlookPoolRepository
+    OutlookPoolRepository().apply_status_events(events)
+    return
+
     rows = [row for row in (events or []) if isinstance(row, dict) and row.get("status")]
     if not rows:
         return

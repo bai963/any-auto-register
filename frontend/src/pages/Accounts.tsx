@@ -50,6 +50,13 @@ import {
   DEFAULT_REGISTER_RETRY_TIMES,
   normalizeRegisterRetryTimes,
 } from '@/lib/registerRetry'
+import {
+  formatCreatedAt,
+  formatSyncTime,
+  normalizeAccount,
+  usageTagColor,
+  usageWindowText,
+} from '@/features/accounts/accountFormatters'
 
 const { Text } = Typography
 
@@ -82,54 +89,6 @@ const TASK_BACKED_ACTIONS: Record<
   },
 }
 
-function parseExtraJson(raw: string | undefined) {
-  if (!raw) return {}
-  try {
-    const parsed = JSON.parse(raw)
-    return parsed && typeof parsed === 'object' ? parsed : {}
-  } catch {
-    return {}
-  }
-}
-
-function normalizeAccount(account: any) {
-  const extra = parseExtraJson(account.extra_json)
-  const syncStatuses = extra.sync_statuses && typeof extra.sync_statuses === 'object' ? extra.sync_statuses : {}
-  const cpaSync = syncStatuses.cpa && typeof syncStatuses.cpa === 'object' ? syncStatuses.cpa : {}
-  const sub2apiSync = syncStatuses.sub2api && typeof syncStatuses.sub2api === 'object' ? syncStatuses.sub2api : {}
-  const cliproxySync = syncStatuses.cliproxyapi && typeof syncStatuses.cliproxyapi === 'object' ? syncStatuses.cliproxyapi : {}
-  const chatgptLocal = extra.chatgpt_local && typeof extra.chatgpt_local === 'object' ? extra.chatgpt_local : {}
-  const plusCheck = extra.plus_check && typeof extra.plus_check === 'object' ? extra.plus_check : {}
-  const totpSecret = String(extra.totp_secret || '')
-  return {
-    ...account,
-    extra,
-    cpaSync,
-    sub2apiSync,
-    cliproxySync,
-    chatgptLocal,
-    plusCheck,
-    totpSecret,
-  }
-}
-
-function formatSyncTime(value?: string) {
-  if (!value) return ''
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
-}
-
-function formatCreatedAt(value?: string) {
-  if (!value) return { date: '-', time: '' }
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) {
-    return { date: value, time: '' }
-  }
-  return {
-    date: date.toLocaleDateString(),
-    time: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-  }
-}
 
 function authStateMeta(state?: string) {
   switch (state) {
@@ -173,34 +132,6 @@ function codexStateMeta(state?: string) {
     default:
       return { color: 'default', label: '未探测' }
   }
-}
-
-function formatUsageResetDate(value: unknown): string {
-  if (!value) return ''
-  const raw = String(value).trim()
-  if (!raw) return ''
-  const numeric = Number(raw)
-  const date = Number.isFinite(numeric)
-    ? new Date(numeric < 10_000_000_000 ? numeric * 1000 : numeric)
-    : new Date(raw)
-  if (Number.isNaN(date.getTime())) return raw
-  const pad = (part: number) => String(part).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
-}
-
-function usageWindowText(window: any): string {
-  const remaining = Number(window?.remaining_percent)
-  if (!Number.isFinite(remaining)) return '-'
-  const reset = formatUsageResetDate(window?.reset_at)
-  return `${remaining.toFixed(remaining % 1 === 0 ? 0 : 1)}%${reset ? ` · 重置 ${reset}` : ''}`
-}
-
-function usageTagColor(window: any): string {
-  const remaining = Number(window?.remaining_percent)
-  if (!Number.isFinite(remaining)) return 'default'
-  if (remaining <= 0) return 'error'
-  if (remaining < 20) return 'warning'
-  return 'success'
 }
 
 const PLUS_TRIAL_FILTERS = [

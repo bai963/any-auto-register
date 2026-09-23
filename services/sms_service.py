@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import threading
 import time
@@ -28,7 +27,6 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable, Optional
 
 from core.db import (
@@ -157,9 +155,6 @@ class BaseSmsProvider(ABC):
             complete = getattr(self, "_db_complete", None)
             if callable(complete):
                 complete(activation_id, "finished")
-            forget = getattr(self, "_forget_activation", None)
-            if callable(forget):
-                forget(activation_id)
         if not ok:
             enqueue = getattr(self, "_enqueue_cleanup", None)
             if callable(enqueue):
@@ -260,50 +255,6 @@ def _safe_bool(value, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() not in {"0", "false", "no", "off", "否"}
-
-
-_SMS_CLEANUP_LOCK = threading.Lock()
-
-
-def _cleanup_queue_file() -> Path:
-    cache_dir = Path(__file__).resolve().parents[1] / "data"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / ".sms_activation_cleanup_queue.json"
-
-
-def _load_cleanup_queue() -> list[dict]:
-    try:
-        raw = json.loads(_cleanup_queue_file().read_text(encoding="utf-8"))
-        return raw if isinstance(raw, list) else []
-    except Exception:
-        return []
-
-
-def _save_cleanup_queue(items: list[dict]) -> None:
-    path = _cleanup_queue_file()
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
-
-def _activation_journal_file() -> Path:
-    cache_dir = Path(__file__).resolve().parents[1] / "data"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / ".sms_activation_journal.json"
-
-
-def _load_activation_journal() -> dict[str, dict]:
-    try:
-        raw = json.loads(_activation_journal_file().read_text(encoding="utf-8"))
-        return raw if isinstance(raw, dict) else {}
-    except Exception:
-        return {}
-
-
-def _save_activation_journal(items: dict[str, dict]) -> None:
-    path = _activation_journal_file()
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
 
 
 # getStatusV2 的数字状态：8 = 已取消
@@ -490,49 +441,17 @@ class SmsActivateProvider(BaseSmsProvider):
                 if state == "refunded": row.refunded_at = now
                 if state == "finished": row.finished_at = now
                 session.add(row); session.commit()
-    def _track_activation(self, activation: SmsActivation, state: str = "rented") -> None:
-        with _SMS_CLEANUP_LOCK:
-            items = _load_activation_journal()
-            items[str(activation.activation_id)] = {
-                "provider": self._cleanup_identity(),
-                "activation_id": str(activation.activation_id),
-                "phone_number": activation.phone_number,
-                "country": activation.country,
-                "state": state,
-                # Activation recovery needs an absolute wall-clock deadline after restart.
-                "rented_at": time.time(),
-                "sms_deadline_at": time.time() + SMS_WAIT_TIMEOUT_SECONDS,
-                "created_at": time.time(),
-                "updated_at": time.time(),
-            }
-            _save_activation_journal(items)
-
     def _set_activation_state(self, activation_id: str, state: str) -> None:
-        with _SMS_CLEANUP_LOCK:
-            items = _load_activation_journal()
-            item = items.get(str(activation_id))
-            if item:
-                item["state"] = state
-                item["updated_at"] = time.time()
-                _save_activation_journal(items)
-
-    def _forget_activation(self, activation_id: str) -> None:
-        with _SMS_CLEANUP_LOCK:
-            items = _load_activation_journal()
-            if items.pop(str(activation_id), None) is not None:
-                _save_activation_journal(items)
-
-    def _recover_activation_journal(self) -> None:
-        """重启后将未关闭 activation 转入 cancel/finish 重试队列。"""
-        with _SMS_CLEANUP_LOCK:
-            items = _load_activation_journal()
-            ours = [item for item in items.values() if item.get("provider") == self._cleanup_identity()]
-        for item in ours:
-            state = str(item.get("state") or "rented")
-            # otp_submitted 的请求可能已被 OpenAI 接受，宁可结算也不能错误退款。
-            action = "finish" if state in {"otp_submitted", "phone_verified", "account_created"} else "cancel"
-            self._enqueue_cleanup(str(item.get("activation_id") or ""), action, f"进程重启恢复: {state}")
-            self._forget_activation(str(item.get("activation_id") or ""))
+        """Persist a lifecycle transition in the durable activation record."""
+        now = _utcnow()
+        with database_write_session() as session:
+            row = session.query(SmsActivationModel).filter_by(
+                provider_identity=self._cleanup_identity(), activation_id=str(activation_id)
+            ).first()
+            if row is not None and row.state not in {"refunded", "finished"}:
+                row.state, row.updated_at, row.version = state, now, row.version + 1
+                session.add(row)
+                session.commit()
 
     def _retry_pending_cleanup(self) -> None:
         """Compatibility no-op. Cleanup retries are run by sms_refund_watchdog."""
@@ -786,8 +705,9 @@ class SmsActivateProvider(BaseSmsProvider):
                     metadata={},
                 )
                 self.current_activation = activation
+                # Persist before returning the billable activation. The database is
+                # the sole recovery source; no per-process JSON journal is needed.
                 self._db_upsert_activation(activation, "rented")
-                self._track_activation(activation, "rented")
                 if len(country_candidates) > 1:
                     logger.info("在国家 %s 租到号 %s (action=%s)", cid, phone, action)
                 return activation
@@ -979,7 +899,6 @@ class SmsActivateProvider(BaseSmsProvider):
         self._used_codes.pop(str(activation_id), None)
         if ok:
             self._db_complete(activation_id, "refunded")
-            self._forget_activation(activation_id)
         else:
             self._enqueue_cleanup(activation_id, "cancel", "取消未使用号码")
         return ok
@@ -1313,19 +1232,30 @@ def cancel_task_sms_activations(settings: dict, task_id: str) -> int:
         session.commit()
     return queued
 
-def resolve_sms_settings(extra_config: Optional[dict] = None) -> dict:
-    """把全局配置里的 ``sms_*`` 项和本次任务的覆盖合并成一份接码配置。"""
-    from core.config_store import config_store
+def merge_sms_settings(global_config: Optional[dict], overrides: Optional[dict] = None) -> dict:
+    """Return the SMS configuration boundary without depending on config storage.
 
+    Application and API callers can inject a mapping, while the legacy resolver
+    below remains the composition adapter for code that still uses config_store.
+    Task-level empty values intentionally do not erase saved global settings.
+    """
     settings = {
         key: value
-        for key, value in (config_store.get_all() or {}).items()
+        for key, value in (global_config or {}).items()
         if key.startswith("sms_")
     }
-    for key, value in (extra_config or {}).items():
+    for key, value in (overrides or {}).items():
         if key.startswith("sms_") and value not in (None, ""):
             settings[key] = value
+
     return settings
+
+
+def resolve_sms_settings(extra_config: Optional[dict] = None) -> dict:
+    """Compatibility adapter: merge persisted SMS settings and task overrides."""
+    from core.config_store import config_store
+
+    return merge_sms_settings(config_store.get_all() or {}, extra_config)
 
 
 def build_phone_callback(

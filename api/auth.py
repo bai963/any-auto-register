@@ -98,7 +98,26 @@ def require_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_
 # ── Password ───────────────────────────────────────────────────────────────────
 
 def _hash_pw(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+    """Create a salted scrypt verifier (legacy SHA-256 remains readable)."""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1)
+    return "scrypt$16384$8$1${}${}".format(_b64url_encode(salt), _b64url_encode(digest))
+
+
+def _verify_password(password: str, stored: str) -> tuple[bool, bool]:
+    """Return ``(valid, needs_upgrade)`` for current and legacy verifiers."""
+    parts = stored.split("$")
+    if len(parts) == 6 and parts[0] == "scrypt":
+        try:
+            n, r, p = (int(parts[1]), int(parts[2]), int(parts[3]))
+            if n < 2**12 or n > 2**16 or n & (n - 1) or not (1 <= r <= 32 and 1 <= p <= 16):
+                return False, False
+            actual = hashlib.scrypt(password.encode("utf-8"), salt=_b64url_decode(parts[4]), n=n, r=r, p=p)
+            return hmac.compare_digest(_b64url_encode(actual), parts[5]), False
+        except (TypeError, ValueError, MemoryError):
+            return False, False
+    legacy = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(legacy, stored), True
 
 
 # ── TOTP (RFC 6238, stdlib only) ───────────────────────────────────────────────
@@ -208,8 +227,11 @@ def login(body: LoginRequest):
     stored = cfg.get("auth_password_hash", "")
     if not stored:
         raise HTTPException(status_code=403, detail="no_password_set")
-    if not hmac.compare_digest(_hash_pw(body.password), stored):
+    valid, needs_upgrade = _verify_password(body.password, stored)
+    if not valid:
         raise HTTPException(status_code=401, detail="密码错误")
+    if needs_upgrade:
+        cfg.set("auth_password_hash", _hash_pw(body.password))
     totp_secret = cfg.get("auth_totp_secret", "")
     if totp_secret:
         temp = secrets.token_hex(24)
@@ -244,7 +266,8 @@ def logout():
 def change_password(body: ChangePasswordRequest):
     cfg = _cfg()
     stored = cfg.get("auth_password_hash", "")
-    if stored and not hmac.compare_digest(_hash_pw(body.current_password), stored):
+    valid, _ = _verify_password(body.current_password, stored) if stored else (True, False)
+    if not valid:
         raise HTTPException(status_code=400, detail="当前密码错误")
     if not body.new_password or len(body.new_password) < 6:
         raise HTTPException(status_code=400, detail="新密码至少需要 6 位")

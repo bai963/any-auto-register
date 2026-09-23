@@ -59,19 +59,28 @@ def _print_runtime_info() -> None:
         )
 
 
+def _validate_web_concurrency(value: str | None = None) -> None:
+    """Reject unsupported multi-process mode before any local task state starts."""
+    raw_value = os.getenv("WEB_CONCURRENCY", "1") if value is None else value
+    try:
+        configured_workers = int(raw_value or 1)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("WEB_CONCURRENCY 必须是正整数") from exc
+    if configured_workers != 1:
+        raise RuntimeError(
+            "当前任务运行时要求 WEB_CONCURRENCY=1；多进程部署需先迁移任务状态到共享存储"
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _print_runtime_info()
     from core.file_logging import configure_file_logging
     configure_file_logging()
     init_db()
-    if DATABASE_BACKEND == "sqlite":
-        # SQLite WAL is safe for the supported 40 network workers only when a
-        # single application process owns the database file.  Multiple web
-        # workers have independent locks and can otherwise starve each other.
-        configured_workers = int(os.getenv("WEB_CONCURRENCY", "1") or 1)
-        if configured_workers != 1:
-            raise RuntimeError("SQLite 模式必须设置 WEB_CONCURRENCY=1；200 并发请使用 PostgreSQL")
+    # 注册任务控制、实时进度和任务历史目前是进程内/本地文件状态。
+    # 即使使用 PostgreSQL，多 Web worker 也不能共享 stop/skip 指令或实时快照。
+    _validate_web_concurrency()
     load_all()
     print("[OK] 数据库初始化完成")
     from core.registry import list_platforms

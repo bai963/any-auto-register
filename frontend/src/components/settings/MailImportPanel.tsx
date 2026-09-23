@@ -1,42 +1,19 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { App, Alert, Button, Card, Form, Input, InputNumber, Popconfirm, Select, Space, Switch, Table, Tag, Typography } from 'antd'
 import type { FormInstance } from 'antd'
 
-import { normalizeMailImportSource, useStoredMailImportSource, type MailImportSource } from '@/lib/mailImport'
-import { apiFetch } from '@/lib/utils'
-
-type MailImportProviderType = 'applemail' | 'microsoft'
-type MailImportSelectionType = MailImportSource
+import { useStoredMailImportSource } from '@/lib/mailImport'
+import {
+  batchDeleteImportedMail,
+  deleteImportedMail,
+  importMail,
+  persistMailImportSource as persistMailImportSourceRequest,
+} from '@/features/mail-import/api'
+import { useMailImportSnapshot } from '@/features/mail-import/useMailImportSnapshot'
+import { toImportApiType, type MailImportProviderType, type MailImportSelectionType, type MailImportSnapshotItem } from '@/features/mail-import/selection'
 
 interface MailImportPanelProps {
   form: FormInstance
-}
-
-interface MailImportProviderDescriptor {
-  type: MailImportProviderType
-  label: string
-  description: string
-  content_placeholder: string
-  helper_text: string
-  supports_filename: boolean
-  filename_label: string
-  filename_placeholder: string
-  preview_empty_text: string
-}
-
-interface MailImportDisplayProvider extends Omit<MailImportProviderDescriptor, 'type'> {
-  type: MailImportSelectionType
-  apiType: MailImportProviderType
-}
-
-interface MailImportSnapshotItem {
-  index: number
-  email: string
-  mailbox: string
-  enabled?: boolean | null
-  status?: string
-  has_oauth?: boolean | null
-  account_type?: 'microsoft_oauth' | 'mailapi_url' | null
 }
 
 interface MailImportSnapshot {
@@ -64,109 +41,6 @@ interface MailImportResult {
   meta: Record<string, unknown>
 }
 
-const SUPPORTED_IMPORT_TYPES: MailImportProviderType[] = ['applemail', 'microsoft']
-
-function isSupportedImportType(value: string): value is MailImportProviderType {
-  return SUPPORTED_IMPORT_TYPES.includes(value as MailImportProviderType)
-}
-
-function toImportApiType(value: MailImportSelectionType): MailImportProviderType {
-  return value === 'applemail' ? 'applemail' : 'microsoft'
-}
-
-/**
- * 选中哪一栏只看已保存的 `mail_import_source`。以前这里按 mail_provider 加
- * luckmail 域名反推，反推路径里没有 MailAPI URL 这个分支，于是选完再回来必然
- * 变回 Outlook。
- *
- * 配置还没加载回来时返回 null：这时候什么都反推不出来，别急着把用户拽到 Outlook。
- */
-function resolvePreferredImportType(
-  currentMailProvider: string,
-  mailImportSource: string,
-): MailImportSelectionType | null {
-  if (!mailImportSource) return null
-  return normalizeMailImportSource(mailImportSource, currentMailProvider)
-}
-
-function buildDisplayProviders(providers: MailImportProviderDescriptor[]) {
-  const items: MailImportDisplayProvider[] = []
-
-  for (const provider of providers) {
-    if (provider.type === 'applemail') {
-      items.push({
-        ...provider,
-        type: 'applemail',
-        apiType: 'applemail',
-        label: 'AppleMail / 小苹果',
-      })
-      continue
-    }
-
-    items.push(
-      {
-        ...provider,
-        type: 'outlook',
-        apiType: 'microsoft',
-        label: 'Outlook',
-        description: '导入 Outlook 本地号池，支持 mixed 导入（OAuth / MailAPI URL）；选中这一栏后注册取号只会取 OAuth 账号，走 Graph/IMAP 收码。',
-        helper_text: '支持自动识别：邮箱----密码----client_id----refresh_token 或 邮箱----mailapi_url；当前视图仅展示 @outlook 的 OAuth 账号。',
-        content_placeholder: 'example@outlook.com----password----client_id----refresh_token',
-        preview_empty_text: '当前还没有可预览的 Outlook 已导入账号。',
-      },
-      {
-        ...provider,
-        type: 'hotmail',
-        apiType: 'microsoft',
-        label: 'Hotmail',
-        description: '导入 Hotmail 本地号池，支持 mixed 导入（OAuth / MailAPI URL）；选中这一栏后注册取号只会取 OAuth 账号，走 Graph/IMAP 收码。',
-        helper_text: '支持自动识别：邮箱----密码----client_id----refresh_token 或 邮箱----mailapi_url；当前视图仅展示 @hotmail 的 OAuth 账号。',
-        content_placeholder: 'example@hotmail.com----password----client_id----refresh_token',
-        preview_empty_text: '当前还没有可预览的 Hotmail 已导入账号。',
-      },
-      {
-        ...provider,
-        type: 'mailapi',
-        apiType: 'microsoft',
-        label: 'MailAPI URL',
-        description: '导入 MailAPI URL 账号池（邮箱----mailapi_url）；选中这一栏后注册取号只会取 account_type=mailapi_url 的账号，通过 URL 轮询网页内容提取验证码。',
-        helper_text: '支持 mixed 导入。当前视图仅展示 account_type=mailapi_url 的账号。',
-        content_placeholder: 'example@hotmail.com----https://mailapi.icu/key?type=html&orderNo=xxxxxxxx',
-        preview_empty_text: '当前还没有可预览的 MailAPI URL 已导入账号。',
-      },
-    )
-  }
-
-  return items
-}
-
-function matchesSelectionType(
-  selectionType: MailImportSelectionType,
-  email: string,
-  accountType?: string | null,
-) {
-  const domain = String(email.split('@')[1] || '').trim().toLowerCase()
-  const normalizedType = String(accountType || 'microsoft_oauth').trim().toLowerCase()
-  if (selectionType === 'mailapi') return normalizedType === 'mailapi_url'
-  if (selectionType === 'hotmail') return normalizedType !== 'mailapi_url' && domain.includes('hotmail')
-  if (selectionType === 'outlook') return normalizedType !== 'mailapi_url' && domain.includes('outlook')
-  return true
-}
-
-function filterSnapshotBySelection(
-  snapshot: MailImportSnapshot | null,
-  selectionType: MailImportSelectionType,
-) {
-  if (!snapshot || selectionType === 'applemail' || snapshot.type !== 'microsoft') {
-    return snapshot
-  }
-
-  return {
-    ...snapshot,
-    items: snapshot.items.filter((item) => matchesSelectionType(selectionType, item.email, item.account_type)),
-  }
-}
-
 function buildImportSuccessMessage(result: MailImportResult) {
   if (result.type === 'applemail') {
     const fileLabel = result.snapshot.filename ? `，已绑定 ${result.snapshot.filename}` : ''
@@ -189,44 +63,25 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
   const watchedPoolDir = String(Form.useWatch('applemail_pool_dir', form) || 'mail')
   const watchedPoolFile = String(Form.useWatch('applemail_pool_file', form) || '')
 
-  const [providers, setProviders] = useState<MailImportDisplayProvider[]>([])
-  const [selectedType, setSelectedType] = useState<MailImportSelectionType>('outlook')
+  const {
+    providers, selectedType, setSelectedType, selectedProvider, loadingProviders,
+    loadingSnapshot, rawSnapshot, setRawSnapshot, snapshot, tableData,
+    selectedRowKeys, setSelectedRowKeys, loadSnapshot,
+  } = useMailImportSnapshot({
+    currentMailProvider, storedMailImportSource, poolDir: watchedPoolDir, poolFile: watchedPoolFile, message,
+  })
   const [content, setContent] = useState('')
   const [filename, setFilename] = useState('')
   const [importing, setImporting] = useState(false)
   const [deletingEmail, setDeletingEmail] = useState('')
   const [batchDeleting, setBatchDeleting] = useState(false)
-  const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
-  const [loadingProviders, setLoadingProviders] = useState(false)
-  const [loadingSnapshot, setLoadingSnapshot] = useState(false)
-  const [rawSnapshot, setRawSnapshot] = useState<MailImportSnapshot | null>(null)
   const [result, setResult] = useState<MailImportResult | null>(null)
   const [aliasSplitEnabled, setAliasSplitEnabled] = useState(false)
   const [aliasSplitCount, setAliasSplitCount] = useState(5)
   const [aliasIncludeOriginal, setAliasIncludeOriginal] = useState(false)
 
-  const providerMap = useMemo(
-    () => new Map(providers.map((provider) => [provider.type, provider])),
-    [providers],
-  )
-  const selectedProvider = providerMap.get(selectedType) ?? null
   const selectedApiType = selectedProvider?.apiType ?? toImportApiType(selectedType)
   const supportsAliasSplit = selectedApiType === 'microsoft'
-  const preferredImportType = useMemo(
-    () => resolvePreferredImportType(currentMailProvider, storedMailImportSource),
-    [storedMailImportSource, currentMailProvider],
-  )
-  const snapshot = useMemo(
-    () => filterSnapshotBySelection(rawSnapshot, selectedType),
-    [rawSnapshot, selectedType],
-  )
-  const tableData = useMemo(
-    () => (snapshot?.items || []).map((item) => ({
-      ...item,
-      key: `${item.email}::${item.mailbox || ''}`,
-    })),
-    [snapshot],
-  )
 
   /**
    * 视图选择立刻落库，不等整页「保存」。用户在这里选完 MailAPI URL 就去别的页面
@@ -234,79 +89,13 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
    */
   const persistImportSource = async (value: MailImportSelectionType) => {
     try {
-      await apiFetch('/config', {
-        method: 'PUT',
-        body: JSON.stringify({ data: { mail_import_source: value } }),
-      })
+      await persistMailImportSourceRequest(value)
     } catch {
       // 表单里那份还在，点「保存配置」还能补上；但得说一声，否则刷新回来又变 Outlook
       // 会看起来像界面自己乱跳
       message.warning('这一栏没能保存，刷新后可能变回 Outlook，点一下「保存配置」再试')
     }
   }
-
-  const loadProviders = async () => {
-    setLoadingProviders(true)
-    try {
-      const data = await apiFetch('/mail-imports/providers') as { items?: MailImportProviderDescriptor[] }
-      const items = Array.isArray(data.items) ? data.items.filter((item) => isSupportedImportType(item.type)) : []
-      const displayProviders = buildDisplayProviders(items)
-      setProviders(displayProviders)
-
-      const available = new Set(displayProviders.map((item) => item.type))
-      setSelectedType((current) => {
-        if (preferredImportType && available.has(preferredImportType)) return preferredImportType
-        if (available.has(current)) return current
-        return displayProviders[0]?.type ?? current
-      })
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : '加载邮箱导入配置失败'
-      message.error(detail)
-    } finally {
-      setLoadingProviders(false)
-    }
-  }
-
-  const loadSnapshot = async (providerType: MailImportSelectionType) => {
-    setLoadingSnapshot(true)
-    try {
-      const apiType = toImportApiType(providerType)
-      const params = new URLSearchParams({ type: apiType })
-      if (apiType === 'applemail') {
-        if (watchedPoolDir.trim()) {
-          params.set('pool_dir', watchedPoolDir.trim())
-        }
-        if (watchedPoolFile.trim()) {
-          params.set('pool_file', watchedPoolFile.trim())
-        }
-      }
-      const nextSnapshot = await apiFetch(`/mail-imports/snapshot?${params.toString()}`) as MailImportSnapshot
-      setRawSnapshot(nextSnapshot)
-    } catch {
-      setRawSnapshot(null)
-    } finally {
-      setLoadingSnapshot(false)
-    }
-  }
-
-  useEffect(() => {
-    void loadProviders()
-  }, [])
-
-  useEffect(() => {
-    if (preferredImportType && providerMap.has(preferredImportType)) {
-      setSelectedType(preferredImportType)
-    }
-  }, [preferredImportType, providerMap])
-
-  useEffect(() => {
-    if (!selectedProvider) return
-    void loadSnapshot(selectedType)
-  }, [selectedProvider, selectedType, watchedPoolDir, watchedPoolFile])
-
-  useEffect(() => {
-    setSelectedRowKeys([])
-  }, [selectedType, rawSnapshot])
 
   const handleImport = async () => {
     const payload = content.trim()
@@ -334,10 +123,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
         body.alias_include_original = aliasIncludeOriginal
       }
 
-      const response = await apiFetch('/mail-imports', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }) as MailImportResult
+      const response = await importMail(body)
 
       setResult(response)
       setRawSnapshot(response.snapshot)
@@ -396,10 +182,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
         body.pool_file = String(form.getFieldValue('applemail_pool_file') || '').trim()
       }
 
-      const response = await apiFetch('/mail-imports/delete', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }) as MailImportResult
+      const response = await deleteImportedMail(body)
 
       setResult(response)
       setRawSnapshot(response.snapshot)
@@ -441,10 +224,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
         body.pool_file = String(form.getFieldValue('applemail_pool_file') || '').trim()
       }
 
-      const response = await apiFetch('/mail-imports/batch-delete', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }) as MailImportResult
+      const response = await batchDeleteImportedMail(body)
 
       setResult(response)
       setRawSnapshot(response.snapshot)
@@ -476,10 +256,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
             body.pool_file = String(form.getFieldValue('applemail_pool_file') || '').trim()
           }
 
-          const response = await apiFetch('/mail-imports/delete', {
-            method: 'POST',
-            body: JSON.stringify(body),
-          }) as MailImportResult
+          const response = await deleteImportedMail(body)
 
           setResult(response)
           setRawSnapshot(response.snapshot)

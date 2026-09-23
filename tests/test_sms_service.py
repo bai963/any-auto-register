@@ -11,6 +11,7 @@ from services.sms_service import (
     build_phone_callback,
     country_label,
     create_sms_provider,
+    merge_sms_settings,
     resolve_sms_settings,
 )
 
@@ -48,6 +49,17 @@ class SmsHelperTests(unittest.TestCase):
         self.assertFalse(safe_bool("off", True))
         self.assertTrue(safe_bool(None, True))
         self.assertFalse(safe_bool("", False))
+
+    def test_merge_sms_settings_is_storage_independent_and_preserves_overrides(self):
+        settings = merge_sms_settings(
+            {"sms_enabled": "1", "sms_country": "52", "other": "ignored"},
+            {"sms_country": "16", "sms_api_key": "task-key", "sms_enabled": ""},
+        )
+
+        self.assertEqual(
+            settings,
+            {"sms_enabled": "1", "sms_country": "16", "sms_api_key": "task-key"},
+        )
 
     def test_country_label_falls_back_to_bare_id(self):
         self.assertEqual(country_label("52"), "52 泰国")
@@ -142,19 +154,14 @@ class TopCountryTests(unittest.TestCase):
 
 
 class ExpiredActivationCleanupTests(unittest.TestCase):
-    def test_watchdog_cancels_only_expired_unreceived_codes(self):
-        provider = SmsActivateProvider(api_key="watchdog-key")
-        identity = provider._cleanup_identity()
-        with mock.patch("services.sms_service._load_activation_journal", return_value={
-            "expired": {"provider": identity, "activation_id": "expired", "sms_deadline_at": 1, "state": "sms_sent"},
-            "received": {"provider": identity, "activation_id": "received", "sms_deadline_at": 1, "state": "otp_submitted"},
-            "fresh": {"provider": identity, "activation_id": "fresh", "sms_deadline_at": 9999999999, "state": "rented"},
-        }), mock.patch("services.sms_service.create_sms_provider", return_value=provider), \
-             mock.patch.object(provider, "cancel", return_value=True) as cancel:
+    def test_compatibility_watchdog_delegates_to_durable_scheduler(self):
+        with mock.patch(
+            "services.sms_refund_watchdog.schedule_due_refunds", return_value=1
+        ) as schedule:
             count = sms_service.cancel_expired_sms_activations({"sms_api_key": "watchdog-key"})
 
         self.assertEqual(count, 1)
-        cancel.assert_called_once_with("expired")
+        schedule.assert_called_once_with({"sms_api_key": "watchdog-key"})
 
 
 class ProviderRequestTests(unittest.TestCase):

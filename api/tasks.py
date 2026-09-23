@@ -18,6 +18,16 @@ from core.task_runtime import (
     global_openai_limiter,
     global_sms_limiter,
 )
+from services.register_tasks.dto import RegisterTaskRequest
+from services.register_tasks.policy import (
+    DEFAULT_REGISTER_RETRY_TIMES,
+    MAX_REGISTER_RETRY_TIMES,
+    PHONE_REGISTER_ATTEMPT_TIMEOUT_SECONDS,
+    REGISTER_ATTEMPT_TIMEOUT_SECONDS,
+    attempt_timeout_seconds,
+    normalize_register_retry_times,
+    uses_sms_register_flow,
+)
 import time, json, asyncio, threading, logging, multiprocessing, queue, os
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -33,11 +43,9 @@ _task_store = RegisterTaskStore(
 )
 
 
-MAX_REGISTER_RETRY_TIMES = 10
 MAX_TASK_CONCURRENCY = 200
 # SQLite 使用 WAL 与 busy timeout 支撑本地中等并发；更高并发仍建议 PostgreSQL。
 SQLITE_MAX_TASK_CONCURRENCY = 40
-DEFAULT_REGISTER_RETRY_TIMES = 1
 # 「重开也是同样结局」的失败最多连着出现几轮就收手。
 #
 # 手机注册里这类失败（账号已建好、接码平台一条短信都没收到）以前是一票否决：
@@ -51,8 +59,6 @@ TASK_STALL_WARNING_SECONDS = 60
 TASK_STALL_DIAGNOSIS_SECONDS = 120
 # 子进程是线程无法强杀时的最终回收边界；手机号+绑定邮箱允许覆盖短信 240 秒和
 # 邮箱绑定余量，普通流程也不允许无限占住 40/200 worker 槽位。
-REGISTER_ATTEMPT_TIMEOUT_SECONDS = 300
-PHONE_REGISTER_ATTEMPT_TIMEOUT_SECONDS = 360
 # phone_with_email 没有父级 attempt deadline；子进程卡死时仍要定期回收已经超过
 # 本地四分钟窗口的 activation，不能等接码平台自己的约二十分钟自然过期。
 _SMS_EXPIRED_ACTIVATION_REAP_INTERVAL_SECONDS = 10
@@ -115,49 +121,10 @@ def _register_platform_child(payload: dict, result_queue) -> None:
         result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
+# Compatibility facade: external callers and tests historically import this
+# private name from api.tasks while the policy now belongs to the service layer.
 def _attempt_timeout_seconds(platform: str, extra: dict) -> Optional[int]:
-    if platform == "chatgpt":
-        flow = str((extra or {}).get("chatgpt_register_flow") or "").strip().lower()
-        if flow == "phone_with_email":
-            # 号码未验证前会按四分钟窗口持续退号换号，不能由 attempt deadline 杀掉。
-            # stop/skip、子进程崩溃和接码 journal 清理仍然有效。
-            return None
-        if flow == "phone" or uses_sms_register_flow(extra):
-            return PHONE_REGISTER_ATTEMPT_TIMEOUT_SECONDS
-    return REGISTER_ATTEMPT_TIMEOUT_SECONDS
-
-
-def uses_sms_register_flow(extra: dict) -> bool:
-    """唯一的手机注册判定：phone_with_email 也必须占用接码预算。"""
-    extra = extra or {}
-    method = str(extra.get("register_method") or "").strip().lower()
-    flow = str(extra.get("chatgpt_register_flow") or "").strip().lower()
-    return method in {"phone", "sms"} or flow in {"phone", "phone_with_email"}
-
-
-def normalize_register_retry_times(value) -> int:
-    """空值按默认算，越界夹回去 —— 这个数字来自表单和配置项，什么都可能填。"""
-    try:
-        parsed = int(str(value).strip())
-    except (TypeError, ValueError):
-        return DEFAULT_REGISTER_RETRY_TIMES
-    return max(0, min(parsed, MAX_REGISTER_RETRY_TIMES))
-
-
-class RegisterTaskRequest(BaseModel):
-    platform: str
-    email: Optional[str] = None
-    password: Optional[str] = None
-    count: int = Field(default=1, ge=1)
-    concurrency: int = Field(default=1, ge=1, le=MAX_TASK_CONCURRENCY)
-    # 整条注册流程失败后再开几轮（每轮都是全新的邮箱/号码/会话）。
-    # 0 = 不重试；一次网络抖动、一个二手号就判 FAIL 太浪费。
-    register_retry_times: int = DEFAULT_REGISTER_RETRY_TIMES
-    register_delay_seconds: float = 0
-    proxy: Optional[str] = None
-    executor_type: str = "protocol"
-    captcha_solver: str = "yescaptcha"
-    extra: dict = Field(default_factory=dict)
+    return attempt_timeout_seconds(platform, extra)
 
 
 class TaskLogBatchDeleteRequest(BaseModel):
@@ -1104,57 +1071,37 @@ def _run_account_batch_task(
                 global_task_concurrency_limiter.release()
 
     try:
-        from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
+        from services.register_tasks.account_batch import run_account_batch_window
 
         # 固定大小的 Future 窗口：账号数很大时内存仍只随并发数增长。
-        max_workers = max(1, min(int(concurrency or 1), max(total, 1)))
-        next_index = 0
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            pending = set()
-
-            def _submit_next() -> bool:
-                nonlocal next_index
-                if next_index >= total or control.is_stop_requested():
-                    return False
-                pending.add(pool.submit(_do_one, next_index, account_ids[next_index]))
-                next_index += 1
-                return True
-
-            while len(pending) < max_workers and _submit_next():
-                pass
-            while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    try:
-                        result = future.result()
-                    except CancelledError:
-                        continue
-                    except Exception as e:
-                        _log(task_id, f"[ERROR] 任务线程异常: {e}")
-                        errors.append(str(e))
-                    else:
-                        if result.outcome == AttemptOutcome.SUCCESS:
-                            success += 1
-                        elif result.outcome == AttemptOutcome.SKIPPED:
-                            skipped += 1
-                        elif result.outcome == AttemptOutcome.STOPPED:
-                            stopped = True
-                        else:
-                            errors.append(result.message)
-                    _task_store.update_counters(
-                        task_id,
-                        success=success,
-                        registered=success + skipped + len(errors),
-                    )
-                    _persist_task_snapshot(task_id)
-
-                if stopped or control.is_stop_requested():
+        def _handle_result(result: AttemptResult | None, error: BaseException | None) -> None:
+            nonlocal success, skipped, stopped
+            if error is not None:
+                _log(task_id, f"[ERROR] 任务线程异常: {error}")
+                errors.append(str(error))
+            elif result is not None:
+                if result.outcome == AttemptOutcome.SUCCESS:
+                    success += 1
+                elif result.outcome == AttemptOutcome.SKIPPED:
+                    skipped += 1
+                elif result.outcome == AttemptOutcome.STOPPED:
                     stopped = True
-                    for future in pending:
-                        future.cancel()
-                    continue
-                while len(pending) < max_workers and _submit_next():
-                    pass
+                else:
+                    errors.append(result.message)
+            _task_store.update_counters(
+                task_id,
+                success=success,
+                registered=success + skipped + len(errors),
+            )
+            _persist_task_snapshot(task_id)
+
+        stopped = run_account_batch_window(
+            account_ids,
+            concurrency=concurrency,
+            is_stop_requested=control.is_stop_requested,
+            handle=_do_one,
+            on_result=_handle_result,
+        ) or stopped
     except Exception as e:
         _log(task_id, f"致命错误: {e}")
         _task_store.finish(

@@ -9,10 +9,15 @@ Outlook、Hotmail、MailAPI URL 三个视图。视图选择以前没地方落库
 
 from __future__ import annotations
 
-MAIL_IMPORT_SOURCE_APPLEMAIL = "applemail"
-MAIL_IMPORT_SOURCE_OUTLOOK = "outlook"
-MAIL_IMPORT_SOURCE_HOTMAIL = "hotmail"
-MAIL_IMPORT_SOURCE_MAILAPI = "mailapi"
+from core.microsoft_mail_source import (
+    ACCOUNT_TYPE_MAILAPI_URL as POOL_ACCOUNT_TYPE_MAILAPI_URL,
+    ACCOUNT_TYPE_MICROSOFT_OAUTH as POOL_ACCOUNT_TYPE_MICROSOFT_OAUTH,
+    MAIL_IMPORT_SOURCE_APPLEMAIL,
+    MAIL_IMPORT_SOURCE_HOTMAIL,
+    MAIL_IMPORT_SOURCE_MAILAPI,
+    MAIL_IMPORT_SOURCE_OUTLOOK,
+    resolve_microsoft_pool_account_type,
+)
 
 MAIL_IMPORT_SOURCES = (
     MAIL_IMPORT_SOURCE_APPLEMAIL,
@@ -27,15 +32,7 @@ _LEGACY_SOURCE_ALIASES = {"microsoft": MAIL_IMPORT_SOURCE_OUTLOOK}
 # mail_provider 取这些值时，界面上显示的是"邮箱导入"
 MAIL_IMPORT_PROVIDERS = ("microsoft", "outlook", MAIL_IMPORT_SOURCE_APPLEMAIL)
 
-POOL_ACCOUNT_TYPE_MICROSOFT_OAUTH = "microsoft_oauth"
-POOL_ACCOUNT_TYPE_MAILAPI_URL = "mailapi_url"
-
-# 三个微软视图共用一张 outlook_accounts 表，但表里混着两类账号；视图决定该取哪一类
-_SOURCE_POOL_ACCOUNT_TYPES = {
-    MAIL_IMPORT_SOURCE_OUTLOOK: POOL_ACCOUNT_TYPE_MICROSOFT_OAUTH,
-    MAIL_IMPORT_SOURCE_HOTMAIL: POOL_ACCOUNT_TYPE_MICROSOFT_OAUTH,
-    MAIL_IMPORT_SOURCE_MAILAPI: POOL_ACCOUNT_TYPE_MAILAPI_URL,
-}
+# 三个微软视图共用一张 outlook_accounts 表；账号类型映射来自无服务依赖的 core 模块。
 
 POOL_ACCOUNT_TYPE_LABELS = {
     POOL_ACCOUNT_TYPE_MICROSOFT_OAUTH: "Outlook / Hotmail（OAuth）",
@@ -73,7 +70,7 @@ def resolve_pool_account_type(value: object) -> str:
     """
     text = str(value or "").strip().lower()
     text = _LEGACY_SOURCE_ALIASES.get(text, text)
-    return _SOURCE_POOL_ACCOUNT_TYPES.get(text, "")
+    return resolve_microsoft_pool_account_type(text)
 
 
 def describe_pool_account_type(account_type: object) -> str:

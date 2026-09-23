@@ -25,6 +25,7 @@ from services.sms_service import (
     _utcnow,
     create_sms_provider,
 )
+from services.sms_lifecycle import REFUNDABLE_STATES, due_refund_reason
 
 logger = logging.getLogger(__name__)
 _STOP = threading.Event()
@@ -254,7 +255,7 @@ def schedule_due_refunds(settings: dict) -> int:
         rows = session.query(SmsActivationModel).filter(
             SmsActivationModel.provider_identity == identity,
             (
-                ((SmsActivationModel.state.in_(("rented", "send_requested"))) &
+                ((SmsActivationModel.state.in_(tuple(REFUNDABLE_STATES - {"sms_sent"}))) &
                  (SmsActivationModel.sms_sent_at.is_(None)) &
                  (SmsActivationModel.activation_deadline_at <= now))
                 |
@@ -274,7 +275,15 @@ def schedule_due_refunds(settings: dict) -> int:
             session.add(row)
             session.add(SmsCleanupJobModel(
                 activation_db_id=row.id, action="cancel", status="pending",
-                next_retry_at=now, reason="SMS refund deadline reached",
+                next_retry_at=now,
+                reason=due_refund_reason(
+                    row.state,
+                    rented_at=row.created_at.timestamp() if row.created_at else None,
+                    sms_sent_at=row.sms_sent_at.timestamp() if row.sms_sent_at else None,
+                    now=now.timestamp(),
+                    max_lifetime_seconds=SMS_ACTIVATION_MAX_LIFETIME_SECONDS,
+                    code_wait_seconds=SMS_CODE_WAIT_AFTER_SEND_SECONDS,
+                ) or "SMS refund deadline reached",
                 created_at=now, updated_at=now,
             ))
         try:
